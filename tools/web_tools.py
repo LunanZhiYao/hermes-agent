@@ -65,6 +65,12 @@ from tools.website_policy import check_website_access
 
 logger = logging.getLogger(__name__)
 
+_ALIYUN_OPEN_SEARCH_URL = os.getenv(
+    "ALIYUN_OPEN_SEARCH_URL",
+    "http://default-i0ao.platform-cn-shanghai.opensearch.aliyuncs.com/v3/openapi/workspaces/default/web-search/ops-web-search-001",
+).strip()
+_ALIYUN_OPEN_SEARCH_TIMEOUT = float(os.getenv("ALIYUN_OPEN_SEARCH_TIMEOUT", "60").strip() or 60)
+
 
 # ─── Backend Selection ────────────────────────────────────────────────────────
 
@@ -88,7 +94,7 @@ def _get_backend() -> str:
     keys manually without running setup.
     """
     configured = (_load_web_config().get("backend") or "").lower().strip()
-    if configured in ("parallel", "firecrawl", "tavily", "exa"):
+    if configured in ("parallel", "firecrawl", "tavily", "exa", "aliyun-open-search"):
         return configured
 
     # Fallback for manual / legacy config — pick the highest-priority
@@ -96,6 +102,7 @@ def _get_backend() -> str:
     # tool gateway is configured for Nous subscribers.
     backend_candidates = (
         ("firecrawl", _has_env("FIRECRAWL_API_KEY") or _has_env("FIRECRAWL_API_URL") or _is_tool_gateway_ready()),
+        ("aliyun-open-search", _has_env("ALIYUN_OPEN_SEARCH_API_KEY")),
         ("parallel", _has_env("PARALLEL_API_KEY")),
         ("tavily", _has_env("TAVILY_API_KEY")),
         ("exa", _has_env("EXA_API_KEY")),
@@ -117,6 +124,8 @@ def _is_backend_available(backend: str) -> bool:
         return check_firecrawl_api_key()
     if backend == "tavily":
         return _has_env("TAVILY_API_KEY")
+    if backend == "aliyun-open-search":
+        return _has_env("ALIYUN_OPEN_SEARCH_API_KEY")
     return False
 
 # ─── Firecrawl Client ────────────────────────────────────────────────────────
@@ -189,6 +198,8 @@ def _web_requires_env() -> list[str]:
         "TAVILY_API_KEY",
         "FIRECRAWL_API_KEY",
         "FIRECRAWL_API_URL",
+        "ALIYUN_OPEN_SEARCH_API_KEY",
+        "ALIYUN_OPEN_SEARCH_URL",
     ]
     if managed_nous_tools_enabled():
         requires.extend(
@@ -360,6 +371,48 @@ def _normalize_tavily_documents(response: dict, fallback_url: str = "") -> List[
             "metadata": {"sourceURL": url_str},
         })
     return documents
+
+
+def _aliyun_open_search(query: str, limit: int = 5) -> dict:
+    """Search using Aliyun OpenSearch web-search API."""
+    api_key = os.getenv("ALIYUN_OPEN_SEARCH_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError(
+            "ALIYUN_OPEN_SEARCH_API_KEY environment variable not set."
+        )
+
+    url = os.getenv("ALIYUN_OPEN_SEARCH_URL", _ALIYUN_OPEN_SEARCH_URL).strip()
+    payload = {
+        "history": [],
+        "query": query,
+        "query_rewrite": True,
+        "top_k": max(1, min(limit, 20)),
+        "content_type": "summary",
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+
+    logger.info("Aliyun OpenSearch search: '%s' (top_k=%d)", query, payload["top_k"])
+    response = httpx.post(url, json=payload, headers=headers, timeout=_ALIYUN_OPEN_SEARCH_TIMEOUT)
+    response.raise_for_status()
+    raw = response.json()
+
+    if raw.get("code") and raw.get("message"):
+        raise ValueError(f"Aliyun OpenSearch error: {raw.get('code')} - {raw.get('message')}")
+
+    web_results = []
+    search_results = (raw.get("result") or {}).get("search_result") or []
+    for i, item in enumerate(search_results):
+        web_results.append({
+            "title": item.get("title", ""),
+            "url": item.get("link", ""),
+            "description": item.get("snippet", ""),
+            "position": item.get("position", i + 1),
+        })
+
+    return {"success": True, "data": {"web": web_results}}
 
 
 def _to_plain_object(value: Any) -> Any:
@@ -1118,6 +1171,15 @@ def web_search_tool(query: str, limit: int = 5) -> str:
             _debug.save()
             return result_json
 
+        if backend == "aliyun-open-search":
+            response_data = _aliyun_open_search(query, limit)
+            debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
+            result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
+            debug_call_data["final_response_size"] = len(result_json)
+            _debug.log_call("web_search_tool", debug_call_data)
+            _debug.save()
+            return result_json
+
         logger.info("Searching the web for: '%s' (limit: %d)", query, limit)
 
         response = _get_firecrawl_client().search(
@@ -1252,6 +1314,11 @@ async def web_extract_tool(
                     "include_images": False,
                 })
                 results = _normalize_tavily_documents(raw, fallback_url=safe_urls[0] if safe_urls else "")
+            elif backend == "aliyun-open-search":
+                return tool_error(
+                    "web_extract is not supported by web.backend=aliyun-open-search. "
+                    "Use web_search, or switch backend to firecrawl/parallel/exa/tavily for extraction."
+                )
             else:
                 # ── Firecrawl extraction ──
                 # Determine requested formats for Firecrawl v2
@@ -1627,6 +1694,12 @@ async def web_crawl_tool(
             _debug.save()
             return cleaned_result
 
+        if backend == "aliyun-open-search":
+            return tool_error(
+                "web_crawl is not supported by web.backend=aliyun-open-search. "
+                "Switch backend to firecrawl or tavily to use crawling."
+            )
+
         # web_crawl requires Firecrawl or the Firecrawl tool-gateway — Parallel has no crawl API
         if not check_firecrawl_api_key():
             return json.dumps({
@@ -1922,9 +1995,12 @@ def check_firecrawl_api_key() -> bool:
 def check_web_api_key() -> bool:
     """Check whether the configured web backend is available."""
     configured = _load_web_config().get("backend", "").lower().strip()
-    if configured in ("exa", "parallel", "firecrawl", "tavily"):
+    if configured in ("exa", "parallel", "firecrawl", "tavily", "aliyun-open-search"):
         return _is_backend_available(configured)
-    return any(_is_backend_available(backend) for backend in ("exa", "parallel", "firecrawl", "tavily"))
+    return any(
+        _is_backend_available(backend)
+        for backend in ("exa", "parallel", "firecrawl", "tavily", "aliyun-open-search")
+    )
 
 
 def check_auxiliary_model() -> bool:
@@ -1959,6 +2035,8 @@ if __name__ == "__main__":
             print("   Using Parallel API (https://parallel.ai)")
         elif backend == "tavily":
             print("   Using Tavily API (https://tavily.com)")
+        elif backend == "aliyun-open-search":
+            print(f"   Using Aliyun OpenSearch API: {os.getenv('ALIYUN_OPEN_SEARCH_URL', _ALIYUN_OPEN_SEARCH_URL)}")
         else:
             if firecrawl_url_available:
                 print(f"   Using self-hosted Firecrawl: {os.getenv('FIRECRAWL_API_URL').strip().rstrip('/')}")

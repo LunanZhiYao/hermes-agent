@@ -324,6 +324,12 @@ class TestBackendSelection:
         with patch("tools.web_tools._load_web_config", return_value={"backend": "Tavily"}):
             assert _get_backend() == "tavily"
 
+    def test_config_aliyun_open_search(self):
+        """web.backend=aliyun-open-search in config → 'aliyun-open-search'."""
+        from tools.web_tools import _get_backend
+        with patch("tools.web_tools._load_web_config", return_value={"backend": "aliyun-open-search"}):
+            assert _get_backend() == "aliyun-open-search"
+
     # ── Fallback (no web.backend in config) ───────────────────────────
 
     def test_fallback_parallel_only_key(self):
@@ -532,6 +538,11 @@ class TestCheckWebApiKey:
             from tools.web_tools import check_web_api_key
             assert check_web_api_key() is True
 
+    def test_aliyun_key_only(self):
+        with patch.dict(os.environ, {"ALIYUN_OPEN_SEARCH_API_KEY": "aliyun-test"}):
+            from tools.web_tools import check_web_api_key
+            assert check_web_api_key() is True
+
     def test_no_keys_returns_false(self):
         from tools.web_tools import check_web_api_key
         assert check_web_api_key() is False
@@ -577,3 +588,49 @@ def test_web_requires_env_includes_exa_key():
     from tools.web_tools import _web_requires_env
 
     assert "EXA_API_KEY" in _web_requires_env()
+
+
+def test_web_requires_env_includes_aliyun_key():
+    from tools.web_tools import _web_requires_env
+
+    requires = _web_requires_env()
+    assert "ALIYUN_OPEN_SEARCH_API_KEY" in requires
+    assert "ALIYUN_OPEN_SEARCH_URL" in requires
+
+
+def test_aliyun_open_search_request_payload_and_headers():
+    import tools.web_tools
+
+    response = MagicMock()
+    response.json.return_value = {
+        "result": {
+            "search_result": [
+                {
+                    "title": "杭州天气",
+                    "link": "https://example.com/weather",
+                    "snippet": "摘要",
+                    "position": 1,
+                }
+            ]
+        }
+    }
+
+    with patch.dict(
+        os.environ,
+        {
+            "ALIYUN_OPEN_SEARCH_API_KEY": "OS-test-token",
+            "ALIYUN_OPEN_SEARCH_URL": "http://aliyun.local/web-search",
+        },
+        clear=False,
+    ), patch("tools.web_tools.httpx.post", return_value=response) as mock_post:
+        data = tools.web_tools._aliyun_open_search("杭州今日天气", limit=5)
+
+    assert data["success"] is True
+    assert data["data"]["web"][0]["url"] == "https://example.com/weather"
+
+    _, kwargs = mock_post.call_args
+    assert kwargs["json"]["query"] == "杭州今日天气"
+    assert kwargs["json"]["query_rewrite"] is True
+    assert kwargs["json"]["top_k"] == 5
+    assert kwargs["json"]["content_type"] == "summary"
+    assert kwargs["headers"]["Authorization"] == "Bearer OS-test-token"
