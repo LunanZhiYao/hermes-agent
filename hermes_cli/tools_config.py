@@ -246,8 +246,8 @@ TOOL_CATEGORIES = {
             },
             {
                 "name": "Aliyun OpenSearch",
-                "badge": "search only",
-                "tag": "阿里云联网搜索 API（仅搜索，不支持 extract/crawl）",
+                "badge": "search + extract",
+                "tag": "阿里云联网搜索 + 文档解析（不支持 crawl）",
                 "web_backend": "aliyun-open-search",
                 "env_vars": [
                     {"key": "ALIYUN_OPEN_SEARCH_API_KEY", "prompt": "Aliyun OpenSearch API key"},
@@ -256,6 +256,12 @@ TOOL_CATEGORIES = {
                         "prompt": "Aliyun OpenSearch URL",
                         "default": "http://default-i0ao.platform-cn-shanghai.opensearch.aliyuncs.com/v3/openapi/workspaces/default/web-search/ops-web-search-001",
                         "url": "https://help.aliyun.com/zh/open-search/search-platform/developer-reference/web-search?spm=a2c4g.11186623.help-menu-29102.d_3_1_18.590d5b39Cc8tk8",
+                    },
+                    {
+                        "key": "ALIYUN_DOCUMENT_ANALYZE_URL",
+                        "prompt": "Aliyun Document Analyze URL",
+                        "default": "http://default-i0ao.platform-cn-shanghai.opensearch.aliyuncs.com/v3/openapi/workspaces/default/document-analyze/ops-document-analyze-001/sync",
+                        "url": "https://help.aliyun.com/zh/open-search/search-platform/developer-reference/api-details?spm=a2c4g.11186623.help-menu-29102.d_3_1_1.6962487f99JiPA&scm=20140722.H_2788419._.OR_help-T_cn~zh-V_1#aOiiM",
                     },
                 ],
             },

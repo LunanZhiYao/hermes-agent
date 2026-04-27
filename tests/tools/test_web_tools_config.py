@@ -596,6 +596,7 @@ def test_web_requires_env_includes_aliyun_key():
     requires = _web_requires_env()
     assert "ALIYUN_OPEN_SEARCH_API_KEY" in requires
     assert "ALIYUN_OPEN_SEARCH_URL" in requires
+    assert "ALIYUN_DOCUMENT_ANALYZE_URL" in requires
 
 
 def test_aliyun_open_search_request_payload_and_headers():
@@ -634,3 +635,68 @@ def test_aliyun_open_search_request_payload_and_headers():
     assert kwargs["json"]["top_k"] == 5
     assert kwargs["json"]["content_type"] == "summary"
     assert kwargs["headers"]["Authorization"] == "Bearer OS-test-token"
+
+
+def test_aliyun_document_analyze_extract_maps_sync_response():
+    import tools.web_tools
+
+    response = MagicMock()
+    response.json.return_value = {
+        "result": {
+            "status": "SUCCESS",
+            "data": {
+                "content": "# hello\nworld",
+                "content_type": "markdown",
+                "page_num": 2,
+            },
+        }
+    }
+
+    with patch.dict(
+        os.environ,
+        {
+            "ALIYUN_OPEN_SEARCH_API_KEY": "OS-test-token",
+            "ALIYUN_DOCUMENT_ANALYZE_URL": "http://aliyun.local/document-analyze/sync",
+        },
+        clear=False,
+    ), patch("tools.web_tools.httpx.post", return_value=response) as mock_post:
+        results = tools.web_tools._aliyun_document_analyze_extract(["https://example.com/a.pdf"])
+
+    assert len(results) == 1
+    doc = results[0]
+    assert doc["url"] == "https://example.com/a.pdf"
+    assert doc["content"] == "# hello\nworld"
+    assert doc["metadata"]["content_type"] == "markdown"
+    assert doc["metadata"]["page_num"] == 2
+
+    _, kwargs = mock_post.call_args
+    assert kwargs["headers"]["Authorization"] == "Bearer OS-test-token"
+    assert kwargs["json"]["document"]["url"] == "https://example.com/a.pdf"
+    assert kwargs["json"]["document"]["file_type"] == "pdf"
+    assert kwargs["json"]["output"]["image_storage"] == "base64"
+    assert kwargs["json"]["strategy"]["enable_semantic"] is False
+
+
+def test_aliyun_document_analyze_extract_defaults_file_type_to_html():
+    import tools.web_tools
+
+    response = MagicMock()
+    response.json.return_value = {
+        "result": {
+            "status": "SUCCESS",
+            "data": {"content": "ok", "content_type": "html", "page_num": 1},
+        }
+    }
+
+    with patch.dict(
+        os.environ,
+        {
+            "ALIYUN_OPEN_SEARCH_API_KEY": "OS-test-token",
+            "ALIYUN_DOCUMENT_ANALYZE_URL": "http://aliyun.local/document-analyze/sync",
+        },
+        clear=False,
+    ), patch("tools.web_tools.httpx.post", return_value=response) as mock_post:
+        tools.web_tools._aliyun_document_analyze_extract(["https://example.com/article"])
+
+    _, kwargs = mock_post.call_args
+    assert kwargs["json"]["document"]["file_type"] == "html"

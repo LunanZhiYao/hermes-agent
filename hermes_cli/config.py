@@ -1454,6 +1454,14 @@ OPTIONAL_ENV_VARS = {
         "category": "tool",
         "advanced": True,
     },
+    "ALIYUN_DOCUMENT_ANALYZE_URL": {
+        "description": "Aliyun document-analyze sync endpoint URL",
+        "prompt": "Aliyun Document Analyze URL",
+        "url": "https://help.aliyun.com/zh/open-search/search-platform/developer-reference/api-details?spm=a2c4g.11186623.help-menu-29102.d_3_1_1.6962487f99JiPA&scm=20140722.H_2788419._.OR_help-T_cn~zh-V_1#aOiiM",
+        "password": False,
+        "category": "tool",
+        "advanced": True,
+    },
     "BROWSERBASE_API_KEY": {
         "description": "Browserbase API key for cloud browser (optional — local browser works without this)",
         "prompt": "Browserbase API key",
@@ -3843,6 +3851,7 @@ def set_config_value(key: str, value: str):
         'EXA_API_KEY', 'PARALLEL_API_KEY', 'FIRECRAWL_API_KEY', 'FIRECRAWL_API_URL',
         'FIRECRAWL_GATEWAY_URL', 'TOOL_GATEWAY_DOMAIN', 'TOOL_GATEWAY_SCHEME',
         'TOOL_GATEWAY_USER_TOKEN', 'TAVILY_API_KEY', 'ALIYUN_OPEN_SEARCH_API_KEY', 'ALIYUN_OPEN_SEARCH_URL',
+        'ALIYUN_DOCUMENT_ANALYZE_URL',
         'BROWSERBASE_API_KEY', 'BROWSERBASE_PROJECT_ID', 'BROWSER_USE_API_KEY',
         'FAL_KEY', 'TELEGRAM_BOT_TOKEN', 'DISCORD_BOT_TOKEN',
         'TERMINAL_SSH_HOST', 'TERMINAL_SSH_USER', 'TERMINAL_SSH_KEY',

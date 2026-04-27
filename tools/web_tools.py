@@ -70,6 +70,13 @@ _ALIYUN_OPEN_SEARCH_URL = os.getenv(
     "http://default-i0ao.platform-cn-shanghai.opensearch.aliyuncs.com/v3/openapi/workspaces/default/web-search/ops-web-search-001",
 ).strip()
 _ALIYUN_OPEN_SEARCH_TIMEOUT = float(os.getenv("ALIYUN_OPEN_SEARCH_TIMEOUT", "60").strip() or 60)
+_ALIYUN_DOCUMENT_ANALYZE_URL = os.getenv(
+    "ALIYUN_DOCUMENT_ANALYZE_URL",
+    "http://default-i0ao.platform-cn-shanghai.opensearch.aliyuncs.com/v3/openapi/workspaces/default/document-analyze/ops-document-analyze-001/sync",
+).strip()
+_ALIYUN_DOCUMENT_ANALYZE_TIMEOUT = float(
+    os.getenv("ALIYUN_DOCUMENT_ANALYZE_TIMEOUT", "120").strip() or 120
+)
 
 
 # ─── Backend Selection ────────────────────────────────────────────────────────
@@ -200,6 +207,7 @@ def _web_requires_env() -> list[str]:
         "FIRECRAWL_API_URL",
         "ALIYUN_OPEN_SEARCH_API_KEY",
         "ALIYUN_OPEN_SEARCH_URL",
+        "ALIYUN_DOCUMENT_ANALYZE_URL",
     ]
     if managed_nous_tools_enabled():
         requires.extend(
@@ -373,6 +381,26 @@ def _normalize_tavily_documents(response: dict, fallback_url: str = "") -> List[
     return documents
 
 
+def _infer_file_type_from_url(url: str) -> Optional[str]:
+    """Infer document file_type from URL suffix for Aliyun document-analyze."""
+    from urllib.parse import urlparse
+
+    path = (urlparse(url).path or "").lower()
+    for ext in ("txt", "pdf", "html", "doc", "docx", "ppt", "pptx"):
+        if path.endswith(f".{ext}"):
+            return ext
+    return None
+
+
+def _normalize_aliyun_file_type(file_type: str) -> str:
+    """Normalize file_type to Aliyun-supported values."""
+    allowed = {"txt", "pdf", "html", "doc", "docx", "ppt", "pptx"}
+    normalized = (file_type or "").strip().lower()
+    if normalized in allowed:
+        return normalized
+    return "html"
+
+
 def _aliyun_open_search(query: str, limit: int = 5) -> dict:
     """Search using Aliyun OpenSearch web-search API."""
     api_key = os.getenv("ALIYUN_OPEN_SEARCH_API_KEY", "").strip()
@@ -413,6 +441,74 @@ def _aliyun_open_search(query: str, limit: int = 5) -> dict:
         })
 
     return {"success": True, "data": {"web": web_results}}
+
+
+def _aliyun_document_analyze_extract(urls: List[str]) -> List[Dict[str, Any]]:
+    """Extract URL content via Aliyun document-analyze sync API."""
+    api_key = os.getenv("ALIYUN_OPEN_SEARCH_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("ALIYUN_OPEN_SEARCH_API_KEY environment variable not set.")
+
+    endpoint = os.getenv("ALIYUN_DOCUMENT_ANALYZE_URL", _ALIYUN_DOCUMENT_ANALYZE_URL).strip()
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+
+    results: List[Dict[str, Any]] = []
+    for url in urls:
+        payload: Dict[str, Any] = {
+            "document": {"url": url},
+            "output": {"image_storage": "base64"},
+            "strategy": {"enable_semantic": False},
+        }
+        file_type = _infer_file_type_from_url(url) or "html"
+        payload["document"]["file_type"] = _normalize_aliyun_file_type(file_type)
+
+        logger.info("Aliyun document-analyze extract: %s", url)
+        response = httpx.post(
+            endpoint,
+            json=payload,
+            headers=headers,
+            timeout=_ALIYUN_DOCUMENT_ANALYZE_TIMEOUT,
+        )
+        response.raise_for_status()
+        raw = response.json()
+
+        if not isinstance(raw, dict):
+            raise ValueError("Aliyun document-analyze returned a non-JSON-object response")
+        if raw.get("code") and raw.get("message"):
+            raise ValueError(f"Aliyun document-analyze error: {raw.get('code')} - {raw.get('message')}")
+
+        result_obj = raw.get("result") or {}
+        status = result_obj.get("status")
+        if status == "FAIL":
+            results.append({
+                "url": url,
+                "title": "",
+                "content": "",
+                "raw_content": "",
+                "error": result_obj.get("error") or "document analyze failed",
+                "metadata": {"sourceURL": url},
+            })
+            continue
+
+        data = result_obj.get("data") or {}
+        content = data.get("content", "") if isinstance(data, dict) else ""
+        content_type = data.get("content_type", "") if isinstance(data, dict) else ""
+        page_num = data.get("page_num") if isinstance(data, dict) else None
+        results.append({
+            "url": url,
+            "title": "",
+            "content": content,
+            "raw_content": content,
+            "metadata": {
+                "sourceURL": url,
+                "content_type": content_type,
+                "page_num": page_num,
+            },
+        })
+    return results
 
 
 def _to_plain_object(value: Any) -> Any:
@@ -1315,10 +1411,7 @@ async def web_extract_tool(
                 })
                 results = _normalize_tavily_documents(raw, fallback_url=safe_urls[0] if safe_urls else "")
             elif backend == "aliyun-open-search":
-                return tool_error(
-                    "web_extract is not supported by web.backend=aliyun-open-search. "
-                    "Use web_search, or switch backend to firecrawl/parallel/exa/tavily for extraction."
-                )
+                results = _aliyun_document_analyze_extract(safe_urls)
             else:
                 # ── Firecrawl extraction ──
                 # Determine requested formats for Firecrawl v2
