@@ -78,7 +78,7 @@ class TestDatabaseEnvConfig:
     def test_missing_required_env_raises(self, monkeypatch):
         for key in ("DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD"):
             monkeypatch.delenv(key, raising=False)
-        with pytest.raises(RuntimeError, match="Missing required DB env vars"):
+        with pytest.raises(ValueError, match="Missing required MySQL environment variable"):
             get_database_env_config()
 
     def test_invalid_port_raises(self, monkeypatch):
@@ -87,7 +87,7 @@ class TestDatabaseEnvConfig:
         monkeypatch.setenv("DB_NAME", "hermes")
         monkeypatch.setenv("DB_USER", "hermes")
         monkeypatch.setenv("DB_PASSWORD", "secret")
-        with pytest.raises(RuntimeError, match="Invalid DB_PORT value"):
+        with pytest.raises(ValueError, match="Invalid DB_PORT value"):
             get_database_env_config()
 
     def test_reads_required_env_successfully(self, monkeypatch):
@@ -104,6 +104,25 @@ class TestDatabaseEnvConfig:
         assert cfg["user"] == "hermes"
         assert cfg["password"] == "secret"
         assert cfg["charset"] == "utf8mb4"
+
+    def test_reads_required_env_from_hermes_dotenv(self, tmp_path):
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}, clear=False):
+            for key in ("DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD", "DB_CHARSET"):
+                os.environ.pop(key, None)
+            save_env_value("DB_HOST", "127.0.0.1")
+            save_env_value("DB_PORT", "3306")
+            save_env_value("DB_NAME", "hermes")
+            save_env_value("DB_USER", "hermes")
+            save_env_value("DB_PASSWORD", "secret")
+            save_env_value("DB_CHARSET", "utf8mb4")
+
+            cfg = get_database_env_config()
+            assert cfg["host"] == "127.0.0.1"
+            assert cfg["port"] == 3306
+            assert cfg["name"] == "hermes"
+            assert cfg["user"] == "hermes"
+            assert cfg["password"] == "secret"
+            assert cfg["charset"] == "utf8mb4"
 
     def test_shared_engine_uses_mysql_driver(self, monkeypatch):
         monkeypatch.setenv("DB_HOST", "127.0.0.1")

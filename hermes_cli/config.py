@@ -29,9 +29,14 @@ logger = logging.getLogger(__name__)
 
 
 def get_database_env_config() -> Dict[str, Any]:
-    """Strict env-only MySQL connection settings (all keys required for runtime).
+    """Strict MySQL connection settings from env / ``~/.hermes/.env``.
 
-    Collation is fixed at the server/database (utf8mb4_0900_ai_ci) — not passed here.
+    All required keys must be present at runtime.  Values are resolved via the
+    same Hermes env loader path as other supported ``.env`` settings, so
+    ``~/.hermes/.env`` works across CLI, gateway, and WebUI entrypoints.
+
+    Collation is fixed at the server/database (utf8mb4_0900_ai_ci) and is not
+    passed here.
     """
     required = {
         "host": "DB_HOST",
@@ -43,7 +48,7 @@ def get_database_env_config() -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     missing: List[str] = []
     for key, env_name in required.items():
-        raw = (os.environ.get(env_name) or "").strip()
+        raw = (get_env_value(env_name) or "").strip()
         if not raw:
             missing.append(env_name)
         out[key] = raw
@@ -51,8 +56,11 @@ def get_database_env_config() -> Dict[str, Any]:
         raise ValueError(
             "Missing required MySQL environment variable(s): " + ", ".join(sorted(missing))
         )
-    out["port"] = int(out["port"])
-    out["charset"] = (os.environ.get("DB_CHARSET") or "utf8mb4").strip()
+    try:
+        out["port"] = int(out["port"])
+    except ValueError as exc:
+        raise ValueError(f"Invalid DB_PORT value: {out['port']!r}") from exc
+    out["charset"] = (get_env_value("DB_CHARSET") or "utf8mb4").strip()
     if not out["charset"]:
         out["charset"] = "utf8mb4"
     return out
@@ -1042,6 +1050,54 @@ REQUIRED_ENV_VARS = {}
 
 # Optional environment variables that enhance functionality
 OPTIONAL_ENV_VARS = {
+    "DB_HOST": {
+        "description": "MySQL host for Hermes session and response storage",
+        "prompt": "MySQL host",
+        "url": None,
+        "password": False,
+        "category": "setting",
+        "advanced": True,
+    },
+    "DB_PORT": {
+        "description": "MySQL port for Hermes session and response storage",
+        "prompt": "MySQL port",
+        "url": None,
+        "password": False,
+        "category": "setting",
+        "advanced": True,
+    },
+    "DB_NAME": {
+        "description": "MySQL database name for Hermes session and response storage",
+        "prompt": "MySQL database name",
+        "url": None,
+        "password": False,
+        "category": "setting",
+        "advanced": True,
+    },
+    "DB_USER": {
+        "description": "MySQL username for Hermes session and response storage",
+        "prompt": "MySQL username",
+        "url": None,
+        "password": False,
+        "category": "setting",
+        "advanced": True,
+    },
+    "DB_PASSWORD": {
+        "description": "MySQL password for Hermes session and response storage",
+        "prompt": "MySQL password",
+        "url": None,
+        "password": True,
+        "category": "setting",
+        "advanced": True,
+    },
+    "DB_CHARSET": {
+        "description": "MySQL charset override for Hermes storage (default: utf8mb4)",
+        "prompt": "MySQL charset",
+        "url": None,
+        "password": False,
+        "category": "setting",
+        "advanced": True,
+    },
     # ── Provider (handled in provider selection, not shown in checklists) ──
     "NOUS_BASE_URL": {
         "description": "Nous Portal base URL override",
