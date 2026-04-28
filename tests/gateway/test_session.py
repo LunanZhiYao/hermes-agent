@@ -1,9 +1,11 @@
 """Tests for gateway session management."""
 
 import json
+import os
 import pytest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
+from sqlalchemy import text
 from gateway.config import Platform, HomeChannel, GatewayConfig, PlatformConfig
 from gateway.session import (
     SessionSource,
@@ -12,6 +14,21 @@ from gateway.session import (
     build_session_context_prompt,
     build_session_key,
 )
+
+
+def _mysql_session_db_or_skip():
+    if not all(os.environ.get(k) for k in ("DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD")):
+        pytest.skip("requires DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD")
+    from hermes_state import SessionDB
+
+    db = SessionDB()
+    with db._engine.begin() as conn:
+        conn.execute(text("SET FOREIGN_KEY_CHECKS=0"))
+        for t in ("messages", "sessions", "state_meta", "schema_version"):
+            conn.execute(text(f"TRUNCATE TABLE {t}"))
+        conn.execute(text("SET FOREIGN_KEY_CHECKS=1"))
+        conn.execute(text("INSERT INTO schema_version (version) VALUES (8)"))
+    return db
 
 
 class TestSessionSourceRoundtrip:
@@ -407,7 +424,7 @@ class TestSessionStoreRewriteTranscript:
         config = GatewayConfig()
         with patch("gateway.session.SessionStore._ensure_loaded"):
             s = SessionStore(sessions_dir=tmp_path, config=config)
-        s._db = None  # no SQLite for these tests
+        s._db = None  # no DB backend for these tests
         s._loaded = True
         return s
 
@@ -494,32 +511,31 @@ class TestLoadTranscriptCorruptLines:
 
 
 class TestLoadTranscriptPreferLongerSource:
-    """Regression: load_transcript must return whichever source (SQLite or JSONL)
+    """Regression: load_transcript must return whichever source (SessionDB or JSONL)
     has more messages to prevent silent truncation.  GH-3212."""
 
     @pytest.fixture()
     def store_with_db(self, tmp_path):
-        """SessionStore with both SQLite and JSONL active."""
-        from hermes_state import SessionDB
-
+        """SessionStore with both SessionDB and JSONL active."""
         config = GatewayConfig()
         with patch("gateway.session.SessionStore._ensure_loaded"):
             s = SessionStore(sessions_dir=tmp_path, config=config)
-        s._db = SessionDB(db_path=tmp_path / "state.db")
+        s._db = _mysql_session_db_or_skip()
         s._loaded = True
-        return s
+        yield s
+        s._db.close()
 
-    def test_jsonl_longer_than_sqlite_returns_jsonl(self, store_with_db):
-        """Legacy session: JSONL has full history, SQLite has only recent turn."""
+    def test_jsonl_longer_than_db_returns_jsonl(self, store_with_db):
+        """Legacy session: JSONL has full history, SessionDB has only recent turn."""
         sid = "legacy_session"
         store_with_db._db.create_session(session_id=sid, source="gateway", model="m")
-        # JSONL has 10 messages (legacy history — written before SQLite existed)
+        # JSONL has 10 messages (legacy history — written before SessionDB existed)
         for i in range(10):
             role = "user" if i % 2 == 0 else "assistant"
             store_with_db.append_to_transcript(
                 sid, {"role": role, "content": f"msg-{i}"}, skip_db=True,
             )
-        # SQLite has only 2 messages (recent turn after migration)
+        # SessionDB has only 2 messages (recent turn after migration)
         store_with_db._db.append_message(session_id=sid, role="user", content="new-q")
         store_with_db._db.append_message(session_id=sid, role="assistant", content="new-a")
 
@@ -527,8 +543,8 @@ class TestLoadTranscriptPreferLongerSource:
         assert len(result) == 10
         assert result[0]["content"] == "msg-0"
 
-    def test_sqlite_longer_than_jsonl_returns_sqlite(self, store_with_db):
-        """Fully migrated session: SQLite has more (JSONL stopped growing)."""
+    def test_db_longer_than_jsonl_returns_db(self, store_with_db):
+        """Fully migrated session: SessionDB has more (JSONL stopped growing)."""
         sid = "migrated_session"
         store_with_db._db.create_session(session_id=sid, source="gateway", model="m")
         # JSONL has 2 old messages
@@ -538,7 +554,7 @@ class TestLoadTranscriptPreferLongerSource:
         store_with_db.append_to_transcript(
             sid, {"role": "assistant", "content": "old-a"}, skip_db=True,
         )
-        # SQLite has 4 messages (superset after migration)
+        # SessionDB has 4 messages (superset after migration)
         for i in range(4):
             role = "user" if i % 2 == 0 else "assistant"
             store_with_db._db.append_message(session_id=sid, role=role, content=f"db-{i}")
@@ -547,8 +563,8 @@ class TestLoadTranscriptPreferLongerSource:
         assert len(result) == 4
         assert result[0]["content"] == "db-0"
 
-    def test_sqlite_empty_falls_back_to_jsonl(self, store_with_db):
-        """No SQLite rows — falls back to JSONL (original behavior preserved)."""
+    def test_db_empty_falls_back_to_jsonl(self, store_with_db):
+        """No SessionDB rows — falls back to JSONL (original behavior preserved)."""
         sid = "no_db_rows"
         store_with_db.append_to_transcript(
             sid, {"role": "user", "content": "hello"}, skip_db=True,
@@ -566,8 +582,8 @@ class TestLoadTranscriptPreferLongerSource:
         result = store_with_db.load_transcript("nonexistent")
         assert result == []
 
-    def test_equal_length_prefers_sqlite(self, store_with_db):
-        """When both have same count, SQLite wins (has richer fields like reasoning)."""
+    def test_equal_length_prefers_db(self, store_with_db):
+        """When both have same count, SessionDB wins (has richer fields like reasoning)."""
         sid = "equal_session"
         store_with_db._db.create_session(session_id=sid, source="gateway", model="m")
         # Write 2 messages to JSONL only
@@ -577,13 +593,13 @@ class TestLoadTranscriptPreferLongerSource:
         store_with_db.append_to_transcript(
             sid, {"role": "assistant", "content": "jsonl-a"}, skip_db=True,
         )
-        # Write 2 different messages to SQLite only
+        # Write 2 different messages to SessionDB only
         store_with_db._db.append_message(session_id=sid, role="user", content="db-q")
         store_with_db._db.append_message(session_id=sid, role="assistant", content="db-a")
 
         result = store_with_db.load_transcript(sid)
         assert len(result) == 2
-        # Should be the SQLite version (equal count → prefers SQLite)
+        # Should be the SessionDB version (equal count -> prefers SessionDB)
         assert result[0]["content"] == "db-q"
 
 
@@ -591,12 +607,10 @@ class TestSessionStoreSwitchSession:
     """Regression coverage for gateway /resume session switching semantics."""
 
     def test_switch_session_reopens_target_session_in_db(self, tmp_path):
-        from hermes_state import SessionDB
-
         config = GatewayConfig()
         with patch("gateway.session.SessionStore._ensure_loaded"):
             store = SessionStore(sessions_dir=tmp_path / "sessions", config=config)
-        db = SessionDB(db_path=tmp_path / "state.db")
+        db = _mysql_session_db_or_skip()
         store._db = db
         store._loaded = True
 
@@ -1044,12 +1058,10 @@ class TestLastPromptTokens:
         assert entry.last_prompt_tokens == 0
 
 class TestRewriteTranscriptPreservesReasoning:
-    """rewrite_transcript must not drop reasoning fields from SQLite."""
+    """rewrite_transcript must not drop reasoning fields from SessionDB."""
 
     def test_reasoning_survives_rewrite(self, tmp_path):
-        from hermes_state import SessionDB
-
-        db = SessionDB(db_path=tmp_path / "test.db")
+        db = _mysql_session_db_or_skip()
         session_id = "reasoning-test"
         db.create_session(session_id=session_id, source="cli")
 
@@ -1087,3 +1099,4 @@ class TestRewriteTranscriptPreservesReasoning:
         assert after[0].get("reasoning_content") == "provider scratchpad"
         assert after[0].get("reasoning_details") == [{"type": "summary", "text": "step by step"}]
         assert after[0].get("codex_reasoning_items") == [{"id": "r1", "type": "reasoning"}]
+        db.close()

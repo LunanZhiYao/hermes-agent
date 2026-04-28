@@ -60,6 +60,17 @@ _CREDENTIAL_SUFFIXES = (
     "_AES_KEY",
 )
 
+# MySQL integration tests (SessionDB) use these — they are *not* LLM API keys
+# and must not be stripped; DB_PASSWORD would otherwise match the *_PASSWORD
+# suffix and break hermes_state tests.
+_MYSQL_INTEGRATION_ENV_NAMES = frozenset({
+    "DB_HOST",
+    "DB_PORT",
+    "DB_NAME",
+    "DB_USER",
+    "DB_PASSWORD",
+})
+
 # Explicit names (for ones that don't fit the suffix pattern)
 _CREDENTIAL_NAMES = frozenset({
     "AWS_ACCESS_KEY_ID",
@@ -224,6 +235,8 @@ def _hermetic_environment(tmp_path, monkeypatch):
     """
     # 1. Blank every credential-shaped env var that's currently set.
     for name in list(os.environ.keys()):
+        if name in _MYSQL_INTEGRATION_ENV_NAMES:
+            continue
         if _looks_like_credential(name):
             monkeypatch.delenv(name, raising=False)
 

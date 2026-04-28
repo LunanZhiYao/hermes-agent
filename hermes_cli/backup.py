@@ -12,7 +12,6 @@ import json
 import logging
 import os
 import shutil
-import sqlite3
 import sys
 import tempfile
 import time
@@ -72,30 +71,22 @@ def _should_exclude(rel_path: Path) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# SQLite safe copy
+# Database safe copy
 # ---------------------------------------------------------------------------
 
 def _safe_copy_db(src: Path, dst: Path) -> bool:
-    """Copy a SQLite database safely using the backup() API.
+    """Copy a database artifact best-effort.
 
-    Handles WAL mode — produces a consistent snapshot even while
-    the DB is being written to.  Falls back to raw copy on failure.
+    MySQL-backed deployments generally don't rely on local *.db runtime files,
+    but legacy backups may still include database-like artifacts. Use a plain
+    copy with clear logging and keep behavior deterministic.
     """
     try:
-        conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
-        backup_conn = sqlite3.connect(str(dst))
-        conn.backup(backup_conn)
-        backup_conn.close()
-        conn.close()
+        shutil.copy2(src, dst)
         return True
     except Exception as exc:
-        logger.warning("SQLite safe copy failed for %s: %s", src, exc)
-        try:
-            shutil.copy2(src, dst)
-            return True
-        except Exception as exc2:
-            logger.error("Raw copy also failed for %s: %s", src, exc2)
-            return False
+        logger.error("Database file copy failed for %s: %s", src, exc)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -186,7 +177,7 @@ def run_backup(args) -> None:
     with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
         for i, (abs_path, rel_path) in enumerate(files_to_add, 1):
             try:
-                # Safe copy for SQLite databases (handles WAL mode)
+                # Safe copy for database-like artifacts
                 if abs_path.suffix == ".db":
                     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
                         tmp_db = Path(tmp.name)
@@ -196,7 +187,7 @@ def run_backup(args) -> None:
                         tmp_db.unlink(missing_ok=True)
                     else:
                         tmp_db.unlink(missing_ok=True)
-                        errors.append(f"  {rel_path}: SQLite safe copy failed")
+                        errors.append(f"  {rel_path}: database file copy failed")
                         continue
                 else:
                     zf.write(abs_path, arcname=str(rel_path))
@@ -249,7 +240,7 @@ def _validate_backup_zip(zf: zipfile.ZipFile) -> tuple[bool, str]:
         return False, "zip archive is empty"
 
     # Look for telltale files that a hermes home would have
-    markers = {"config.yaml", ".env", "state.db"}
+    markers = {"config.yaml", ".env"}
     found = set()
     for n in names:
         # Could be at the root or one level deep (if someone zipped the directory)
@@ -260,7 +251,7 @@ def _validate_backup_zip(zf: zipfile.ZipFile) -> tuple[bool, str]:
     if not found:
         return False, (
             "zip does not appear to be a Hermes backup "
-            "(no config.yaml, .env, or state databases found)"
+            "(no config.yaml, .env, or settings.json found)"
         )
 
     return True, ""
@@ -455,7 +446,7 @@ def run_import(args) -> None:
 # Everything else is either regeneratable (logs, cache) or managed separately
 # (skills, repo, sessions/).
 _QUICK_STATE_FILES = (
-    "state.db",
+    "settings.json",
     "config.yaml",
     ".env",
     "auth.json",

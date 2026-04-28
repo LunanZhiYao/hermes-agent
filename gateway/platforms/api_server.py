@@ -28,10 +28,11 @@ import logging
 import os
 import socket as _socket
 import re
-import sqlite3
 import time
 import uuid
 from typing import Any, Dict, List, Optional
+from sqlalchemy import Column, Float, MetaData, String, Table, Text, delete, func, select, update
+from sqlalchemy.exc import OperationalError
 
 try:
     from aiohttp import web
@@ -46,6 +47,7 @@ from gateway.platforms.base import (
     SendResult,
     is_network_accessible,
 )
+from hermes_cli.db_engine import get_engine
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +59,7 @@ MAX_REQUEST_BYTES = 1_000_000  # 1 MB default limit for POST bodies
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+_DDL_RETRY_MYSQL_ERROR_CODES = frozenset({1050, 1205, 1213, 1684})
 
 
 def _normalize_chat_content(
@@ -278,107 +281,151 @@ def check_api_server_requirements() -> bool:
 
 class ResponseStore:
     """
-    SQLite-backed LRU store for Responses API state.
+    SQLAlchemy Core-backed LRU store for Responses API state.
 
     Each stored response includes the full internal conversation history
     (with tool calls and results) so it can be reconstructed on subsequent
     requests via previous_response_id.
 
-    Persists across gateway restarts.  Falls back to in-memory SQLite
-    if the on-disk path is unavailable.
+    Rows live in the application database via the process-wide ``get_engine()``
+    (so they typically survive process restarts like any other DB data).  This
+    class does not own engine lifecycle; see ``close()``.
     """
 
     def __init__(self, max_size: int = MAX_STORED_RESPONSES, db_path: str = None):
         self._max_size = max_size
-        if db_path is None:
+        self._last_accessed_at = 0
+        self._engine = get_engine()
+        metadata = MetaData()
+        self._responses = Table(
+            "responses",
+            metadata,
+            Column("response_id", String(255), primary_key=True),
+            Column("data", Text, nullable=False),
+            Column("accessed_at", Float, nullable=False),
+        )
+        self._conversations = Table(
+            "conversations",
+            metadata,
+            Column("name", String(255), primary_key=True),
+            Column("response_id", String(255), nullable=False),
+        )
+        self._run_with_mysql_ddl_retry(lambda: metadata.create_all(self._engine))
+
+    @staticmethod
+    def _run_with_mysql_ddl_retry(fn, attempts: int = 6, delay_s: float = 0.2) -> None:
+        for i in range(attempts):
             try:
-                from hermes_cli.config import get_hermes_home
-                db_path = str(get_hermes_home() / "response_store.db")
-            except Exception:
-                db_path = ":memory:"
-        try:
-            self._conn = sqlite3.connect(db_path, check_same_thread=False)
-        except Exception:
-            self._conn = sqlite3.connect(":memory:", check_same_thread=False)
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute(
-            """CREATE TABLE IF NOT EXISTS responses (
-                response_id TEXT PRIMARY KEY,
-                data TEXT NOT NULL,
-                accessed_at REAL NOT NULL
-            )"""
+                fn()
+                return
+            except OperationalError as exc:
+                orig = getattr(exc, "orig", None)
+                code = None
+                if orig is not None and hasattr(orig, "args") and orig.args:
+                    try:
+                        code = int(orig.args[0])
+                    except (TypeError, ValueError):
+                        code = None
+                if code not in _DDL_RETRY_MYSQL_ERROR_CODES or i == attempts - 1:
+                    raise
+                time.sleep(delay_s * (i + 1))
+
+    def _next_accessed_at(self) -> float:
+        """Return a strictly monotonic rank for stable LRU ordering.
+
+        MySQL FLOAT can lose sub-second precision around epoch-scale values, so
+        we avoid wall-clock timestamps here and store an incrementing rank.
+        """
+        self._last_accessed_at += 1
+        return float(self._last_accessed_at)
+
+    def _delete_conversation_rows_for_responses(
+        self, conn, response_ids: List[str]
+    ) -> None:
+        """Remove conversation name→response_id rows pointing at the given ids."""
+        if not response_ids:
+            return
+        conn.execute(
+            delete(self._conversations).where(
+                self._conversations.c.response_id.in_(response_ids)
+            )
         )
-        self._conn.execute(
-            """CREATE TABLE IF NOT EXISTS conversations (
-                name TEXT PRIMARY KEY,
-                response_id TEXT NOT NULL
-            )"""
-        )
-        self._conn.commit()
 
     def get(self, response_id: str) -> Optional[Dict[str, Any]]:
         """Retrieve a stored response by ID (updates access time for LRU)."""
-        row = self._conn.execute(
-            "SELECT data FROM responses WHERE response_id = ?", (response_id,)
-        ).fetchone()
-        if row is None:
-            return None
-        self._conn.execute(
-            "UPDATE responses SET accessed_at = ? WHERE response_id = ?",
-            (time.time(), response_id),
-        )
-        self._conn.commit()
-        return json.loads(row[0])
+        with self._engine.begin() as conn:
+            row = conn.execute(
+                select(self._responses.c.data).where(self._responses.c.response_id == response_id)
+            ).first()
+            if row is None:
+                return None
+            conn.execute(
+                update(self._responses)
+                .where(self._responses.c.response_id == response_id)
+                .values(accessed_at=self._next_accessed_at())
+            )
+            return json.loads(row.data)
 
     def put(self, response_id: str, data: Dict[str, Any]) -> None:
         """Store a response, evicting the oldest if at capacity."""
-        self._conn.execute(
-            "INSERT OR REPLACE INTO responses (response_id, data, accessed_at) VALUES (?, ?, ?)",
-            (response_id, json.dumps(data, default=str), time.time()),
-        )
-        # Evict oldest entries beyond max_size
-        count = self._conn.execute("SELECT COUNT(*) FROM responses").fetchone()[0]
-        if count > self._max_size:
-            self._conn.execute(
-                "DELETE FROM responses WHERE response_id IN "
-                "(SELECT response_id FROM responses ORDER BY accessed_at ASC LIMIT ?)",
-                (count - self._max_size,),
+        with self._engine.begin() as conn:
+            # Keep "replace" semantics on existing keys without dialect-specific SQL.
+            conn.execute(delete(self._responses).where(self._responses.c.response_id == response_id))
+            conn.execute(
+                self._responses.insert().values(
+                    response_id=response_id,
+                    data=json.dumps(data, default=str),
+                    accessed_at=self._next_accessed_at(),
+                )
             )
-        self._conn.commit()
+            count = conn.execute(select(func.count()).select_from(self._responses)).scalar_one()
+            overflow = count - self._max_size
+            if overflow > 0:
+                oldest_ids = conn.execute(
+                    select(self._responses.c.response_id)
+                    .order_by(self._responses.c.accessed_at.asc(), self._responses.c.response_id.asc())
+                    .limit(overflow)
+                ).scalars().all()
+                if oldest_ids:
+                    conn.execute(delete(self._responses).where(self._responses.c.response_id.in_(oldest_ids)))
+                    self._delete_conversation_rows_for_responses(conn, list(oldest_ids))
 
     def delete(self, response_id: str) -> bool:
         """Remove a response from the store. Returns True if found and deleted."""
-        cursor = self._conn.execute(
-            "DELETE FROM responses WHERE response_id = ?", (response_id,)
-        )
-        self._conn.commit()
-        return cursor.rowcount > 0
+        with self._engine.begin() as conn:
+            result = conn.execute(delete(self._responses).where(self._responses.c.response_id == response_id))
+            deleted = (result.rowcount or 0) > 0
+            if deleted:
+                self._delete_conversation_rows_for_responses(conn, [response_id])
+            return deleted
 
     def get_conversation(self, name: str) -> Optional[str]:
         """Get the latest response_id for a conversation name."""
-        row = self._conn.execute(
-            "SELECT response_id FROM conversations WHERE name = ?", (name,)
-        ).fetchone()
-        return row[0] if row else None
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                select(self._conversations.c.response_id).where(self._conversations.c.name == name)
+            ).first()
+            return row.response_id if row else None
 
     def set_conversation(self, name: str, response_id: str) -> None:
         """Map a conversation name to its latest response_id."""
-        self._conn.execute(
-            "INSERT OR REPLACE INTO conversations (name, response_id) VALUES (?, ?)",
-            (name, response_id),
-        )
-        self._conn.commit()
+        with self._engine.begin() as conn:
+            conn.execute(delete(self._conversations).where(self._conversations.c.name == name))
+            conn.execute(self._conversations.insert().values(name=name, response_id=response_id))
 
     def close(self) -> None:
-        """Close the database connection."""
-        try:
-            self._conn.close()
-        except Exception:
-            pass
+        """Release store-local resources.
+
+        The backing Engine is shared (``get_engine()``) and must not be
+        disposed here — that would tear down the process-global pool for all
+        consumers.  Callers may still invoke ``close()`` for API symmetry; it is
+        a no-op at the engine level.
+        """
+        return None
 
     def __len__(self) -> int:
-        row = self._conn.execute("SELECT COUNT(*) FROM responses").fetchone()
-        return row[0] if row else 0
+        with self._engine.connect() as conn:
+            return int(conn.execute(select(func.count()).select_from(self._responses)).scalar_one())
 
 
 # ---------------------------------------------------------------------------
@@ -686,7 +733,7 @@ class APIServerAdapter(BasePlatformAdapter):
     def _ensure_session_db(self):
         """Lazily initialise and return the shared SessionDB instance.
 
-        Sessions are persisted to ``state.db`` so that ``hermes sessions list``
+        Sessions are persisted via SessionDB (MySQL) so that ``hermes sessions list``
         shows API-server conversations alongside CLI and gateway ones.
         """
         if self._session_db is None:
@@ -861,7 +908,7 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         # Allow caller to continue an existing session by passing X-Hermes-Session-Id.
-        # When provided, history is loaded from state.db instead of from the request body.
+        # When provided, history is loaded from SessionDB instead of from the request body.
         #
         # Security: session continuation exposes conversation history, so it is
         # only allowed when the API key is configured and the request is

@@ -572,45 +572,17 @@ def run_doctor(args):
             check_ok(f"Created {_DHH}/memories/")
             fixed_count += 1
     
-    # Check SQLite session store
-    state_db_path = hermes_home / "state.db"
-    if state_db_path.exists():
+    # Check SessionDB (MySQL) connectivity and metadata access
+    try:
+        from hermes_state import SessionDB
+        db = SessionDB()
         try:
-            import sqlite3
-            conn = sqlite3.connect(str(state_db_path))
-            cursor = conn.execute("SELECT COUNT(*) FROM sessions")
-            count = cursor.fetchone()[0]
-            conn.close()
-            check_ok(f"{_DHH}/state.db exists ({count} sessions)")
-        except Exception as e:
-            check_warn(f"{_DHH}/state.db exists but has issues: {e}")
-    else:
-        check_info(f"{_DHH}/state.db not created yet (will be created on first session)")
-
-    # Check WAL file size (unbounded growth indicates missed checkpoints)
-    wal_path = hermes_home / "state.db-wal"
-    if wal_path.exists():
-        try:
-            wal_size = wal_path.stat().st_size
-            if wal_size > 50 * 1024 * 1024:  # 50 MB
-                check_warn(
-                    f"WAL file is large ({wal_size // (1024*1024)} MB)",
-                    "(may indicate missed checkpoints)"
-                )
-                if should_fix:
-                    import sqlite3
-                    conn = sqlite3.connect(str(state_db_path))
-                    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-                    conn.close()
-                    new_size = wal_path.stat().st_size if wal_path.exists() else 0
-                    check_ok(f"WAL checkpoint performed ({wal_size // 1024}K → {new_size // 1024}K)")
-                    fixed_count += 1
-                else:
-                    issues.append("Large WAL file — run 'hermes doctor --fix' to checkpoint")
-            elif wal_size > 10 * 1024 * 1024:  # 10 MB
-                check_info(f"WAL file is {wal_size // (1024*1024)} MB (normal for active sessions)")
-        except Exception:
-            pass
+            count = db.session_count()
+            check_ok(f"SessionDB reachable ({count} sessions)")
+        finally:
+            db.close()
+    except Exception as e:
+        check_warn("SessionDB unavailable", f"({e})")
 
     _check_gateway_service_linger(issues)
 

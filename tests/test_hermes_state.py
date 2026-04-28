@@ -1,19 +1,73 @@
-"""Tests for hermes_state.py — SessionDB SQLite CRUD, FTS5 search, export."""
+"""Tests for hermes_state.py — SessionDB on MySQL (CRUD, FULLTEXT search, export)."""
 
+import os
 import time
+
 import pytest
-from pathlib import Path
+from sqlalchemy import text
 
 from hermes_state import SessionDB
 
 
-@pytest.fixture()
-def db(tmp_path):
-    """Create a SessionDB with a temp database file."""
-    db_path = tmp_path / "test_state.db"
-    session_db = SessionDB(db_path=db_path)
+def _mysql_env_configured() -> bool:
+    return all(os.environ.get(k) for k in ("DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD"))
+
+
+def _reset_mysql_tables(db: SessionDB) -> None:
+    with db._engine.begin() as conn:
+        conn.execute(text("SET FOREIGN_KEY_CHECKS=0"))
+        for t in ("messages", "sessions", "state_meta", "schema_version"):
+            conn.execute(text(f"TRUNCATE TABLE {t}"))
+        conn.execute(text("SET FOREIGN_KEY_CHECKS=1"))
+        conn.execute(text("INSERT INTO schema_version (version) VALUES (8)"))
+
+
+def _session_update(
+    db: SessionDB,
+    session_id: str,
+    *,
+    started_at: float = None,
+    ended_at: float = None,
+    end_reason: str = None,
+) -> None:
+    sets = []
+    params: dict = {"id": session_id}
+    if started_at is not None:
+        sets.append("started_at = :started_at")
+        params["started_at"] = started_at
+    if ended_at is not None:
+        sets.append("ended_at = :ended_at")
+        params["ended_at"] = ended_at
+    if end_reason is not None:
+        sets.append("end_reason = :end_reason")
+        params["end_reason"] = end_reason
+    if not sets:
+        return
+    with db._engine.begin() as conn:
+        conn.execute(
+            text(f"UPDATE sessions SET {', '.join(sets)} WHERE id = :id"),
+            params,
+        )
+
+
+@pytest.fixture(scope="session")
+def _shared_mysql_session_db():
+    """Session-scoped SessionDB to avoid repeated schema DDL in each test."""
+    if not _mysql_env_configured():
+        pytest.skip(
+            "Set DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD to run SessionDB integration tests"
+        )
+    session_db = SessionDB()
     yield session_db
     session_db.close()
+
+
+@pytest.fixture()
+def db(_shared_mysql_session_db):
+    """Function-scoped logical reset using shared schema/engine."""
+    session_db = _shared_mysql_session_db
+    _reset_mysql_tables(session_db)
+    yield session_db
 
 
 # =========================================================================
@@ -589,11 +643,9 @@ class TestFTS5Search:
 class TestCJKSearchFallback:
     """Regression tests for CJK search (see #11511).
 
-    SQLite FTS5's default tokenizer treats contiguous CJK runs as a single
-    token ("和其他agent的聊天记录" → one token), so substring queries like
-    "记忆断裂" return 0 rows despite the data being present. SessionDB falls
-    back to LIKE substring matching whenever FTS5 returns no results and
-    the query contains CJK characters.
+    When FULLTEXT returns no rows and the query contains CJK characters,
+    SessionDB falls back to LIKE substring matching (same idea as the old
+    SQLite FTS5 + fallback path).
     """
 
     def test_cjk_detection_covers_all_ranges(self):
@@ -857,11 +909,7 @@ class TestPruneSessions:
         db.create_session(session_id="old", source="cli")
         db.end_session("old", end_reason="done")
         # Manually backdate started_at
-        db._conn.execute(
-            "UPDATE sessions SET started_at = ? WHERE id = ?",
-            (time.time() - 100 * 86400, "old"),
-        )
-        db._conn.commit()
+        _session_update(db, "old", started_at=time.time() - 100 * 86400)
 
         # Create a recent session
         db.create_session(session_id="new", source="cli")
@@ -876,11 +924,7 @@ class TestPruneSessions:
     def test_prune_skips_active_sessions(self, db):
         db.create_session(session_id="active", source="cli")
         # Backdate but don't end
-        db._conn.execute(
-            "UPDATE sessions SET started_at = ? WHERE id = ?",
-            (time.time() - 200 * 86400, "active"),
-        )
-        db._conn.commit()
+        _session_update(db, "active", started_at=time.time() - 200 * 86400)
 
         pruned = db.prune_sessions(older_than_days=90)
         assert pruned == 0
@@ -890,11 +934,7 @@ class TestPruneSessions:
         for sid, src in [("old_cli", "cli"), ("old_tg", "telegram")]:
             db.create_session(session_id=sid, source=src)
             db.end_session(sid, end_reason="done")
-            db._conn.execute(
-                "UPDATE sessions SET started_at = ? WHERE id = ?",
-                (time.time() - 200 * 86400, sid),
-            )
-        db._conn.commit()
+            _session_update(db, sid, started_at=time.time() - 200 * 86400)
 
         pruned = db.prune_sessions(older_than_days=90, source="cli")
         assert pruned == 1
@@ -918,10 +958,7 @@ class TestPruneSessions:
 
         # Backdate A and B to be old; C and D stay recent
         for sid, ts in [("A", old_ts), ("B", old_ts), ("C", recent_ts), ("D", recent_ts)]:
-            db._conn.execute(
-                "UPDATE sessions SET started_at = ? WHERE id = ?", (ts, sid)
-            )
-        db._conn.commit()
+            _session_update(db, sid, started_at=ts)
 
         # Should not raise IntegrityError
         pruned = db.prune_sessions(older_than_days=90)
@@ -948,10 +985,7 @@ class TestPruneSessions:
         db.end_session("Z", end_reason="done")
 
         for sid in ("X", "Y", "Z"):
-            db._conn.execute(
-                "UPDATE sessions SET started_at = ? WHERE id = ?", (old_ts, sid)
-            )
-        db._conn.commit()
+            _session_update(db, sid, started_at=old_ts)
 
         pruned = db.prune_sessions(older_than_days=90)
         assert pruned == 3
@@ -1152,107 +1186,45 @@ class TestSanitizeTitle:
 
 
 class TestSchemaInit:
-    def test_wal_mode(self, db):
-        cursor = db._conn.execute("PRAGMA journal_mode")
-        mode = cursor.fetchone()[0]
-        assert mode == "wal"
-
-    def test_foreign_keys_enabled(self, db):
-        cursor = db._conn.execute("PRAGMA foreign_keys")
-        assert cursor.fetchone()[0] == 1
-
     def test_tables_exist(self, db):
-        cursor = db._conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
-        )
-        tables = {row[0] for row in cursor.fetchall()}
+        with db._engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT table_name FROM information_schema.tables "
+                    "WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE'"
+                )
+            ).fetchall()
+        tables = {row[0] for row in rows}
         assert "sessions" in tables
         assert "messages" in tables
         assert "schema_version" in tables
 
     def test_schema_version(self, db):
-        cursor = db._conn.execute("SELECT version FROM schema_version")
-        version = cursor.fetchone()[0]
+        with db._engine.connect() as conn:
+            version = conn.execute(text("SELECT version FROM schema_version")).scalar()
         assert version == 8
 
     def test_title_column_exists(self, db):
-        """Verify the title column was created in the sessions table."""
-        cursor = db._conn.execute("PRAGMA table_info(sessions)")
-        columns = {row[1] for row in cursor.fetchall()}
+        with db._engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = DATABASE() AND table_name = 'sessions'"
+                )
+            ).fetchall()
+        columns = {row[0] for row in rows}
         assert "title" in columns
 
-    def test_migration_from_v2(self, tmp_path):
-        """Simulate a v2 database and verify migration adds title column."""
-        import sqlite3
-
-        db_path = tmp_path / "migrate_test.db"
-        conn = sqlite3.connect(str(db_path))
-        # Create v2 schema (without title column)
-        conn.executescript("""
-            CREATE TABLE schema_version (version INTEGER NOT NULL);
-            INSERT INTO schema_version (version) VALUES (2);
-
-            CREATE TABLE sessions (
-                id TEXT PRIMARY KEY,
-                source TEXT NOT NULL,
-                user_id TEXT,
-                model TEXT,
-                model_config TEXT,
-                system_prompt TEXT,
-                parent_session_id TEXT,
-                started_at REAL NOT NULL,
-                ended_at REAL,
-                end_reason TEXT,
-                message_count INTEGER DEFAULT 0,
-                tool_call_count INTEGER DEFAULT 0,
-                input_tokens INTEGER DEFAULT 0,
-                output_tokens INTEGER DEFAULT 0
-            );
-
-            CREATE TABLE messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                role TEXT NOT NULL,
-                content TEXT,
-                tool_call_id TEXT,
-                tool_calls TEXT,
-                tool_name TEXT,
-                timestamp REAL NOT NULL,
-                token_count INTEGER,
-                finish_reason TEXT
-            );
-        """)
-        conn.execute(
-            "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
-            ("existing", "cli", 1000.0),
-        )
-        conn.commit()
-        conn.close()
-
-        # Open with SessionDB — should migrate to v8
-        migrated_db = SessionDB(db_path=db_path)
-
-        # Verify migration
-        cursor = migrated_db._conn.execute("SELECT version FROM schema_version")
-        assert cursor.fetchone()[0] == 8
-
-        # Verify title column exists and is NULL for existing sessions
-        session = migrated_db.get_session("existing")
-        assert session is not None
-        assert session["title"] is None
-
-        # Verify api_call_count column was added with default 0
-        cursor = migrated_db._conn.execute(
-            "SELECT api_call_count FROM sessions WHERE id = 'existing'"
-        )
-        assert cursor.fetchone()[0] == 0
-
-        # Verify we can set title on migrated session
-        assert migrated_db.set_session_title("existing", "Migrated Title") is True
-        session = migrated_db.get_session("existing")
-        assert session["title"] == "Migrated Title"
-
-        migrated_db.close()
+    def test_messages_fulltext_index(self, db):
+        with db._engine.connect() as conn:
+            n = conn.execute(
+                text(
+                    "SELECT COUNT(1) FROM information_schema.statistics "
+                    "WHERE table_schema = DATABASE() AND table_name = 'messages' "
+                    "AND index_type = 'FULLTEXT'"
+                )
+            ).scalar()
+        assert int(n or 0) >= 1
 
 
 class TestTitleUniqueness:
@@ -1469,51 +1441,27 @@ class TestCompressionChainProjection:
 
         Returns (root_id, delegate_id, mid_id, tip_id).
         """
-        import time as _time
-        # Root that gets compressed
         db.create_session("root1", "cli")
-        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0, "root1"))
+        _session_update(db, "root1", started_at=t0)
         db.append_message("root1", "user", "help me refactor auth")
 
-        # Delegate subagent spawned while root1 was live (before it ended)
         db.create_session("delegate1", "cli", parent_session_id="root1")
-        db._conn.execute(
-            "UPDATE sessions SET started_at=?, ended_at=? WHERE id=?",
-            (t0 + 600, t0 + 650, "delegate1"),
-        )
+        _session_update(db, "delegate1", started_at=t0 + 600, ended_at=t0 + 650)
         db.append_message("delegate1", "user", "delegate task")
 
-        # root1 compressed at t0+1800
         t_compress_root = t0 + 1800
-        db._conn.execute(
-            "UPDATE sessions SET ended_at=?, end_reason=? WHERE id=?",
-            (t_compress_root, "compression", "root1"),
-        )
+        _session_update(db, "root1", ended_at=t_compress_root, end_reason="compression")
 
-        # Continuation mid created 1s after parent ended
         db.create_session("mid1", "cli", parent_session_id="root1")
-        db._conn.execute(
-            "UPDATE sessions SET started_at=? WHERE id=?",
-            (t_compress_root + 1, "mid1"),
-        )
+        _session_update(db, "mid1", started_at=t_compress_root + 1)
         db.append_message("mid1", "user", "continuing")
 
-        # mid1 also compressed
         t_compress_mid = t_compress_root + 1800
-        db._conn.execute(
-            "UPDATE sessions SET ended_at=?, end_reason=? WHERE id=?",
-            (t_compress_mid, "compression", "mid1"),
-        )
+        _session_update(db, "mid1", ended_at=t_compress_mid, end_reason="compression")
 
-        # Tip — latest continuation
         db.create_session("tip1", "cli", parent_session_id="mid1")
-        db._conn.execute(
-            "UPDATE sessions SET started_at=? WHERE id=?",
-            (t_compress_mid + 1, "tip1"),
-        )
+        _session_update(db, "tip1", started_at=t_compress_mid + 1)
         db.append_message("tip1", "user", "latest message")
-
-        db._conn.commit()
         return ("root1", "delegate1", "mid1", "tip1")
 
     def test_get_compression_tip_walks_full_chain(self, db):
@@ -1547,7 +1495,6 @@ class TestCompressionChainProjection:
         # Add an uncompressed root for comparison.
         db.create_session("solo", "cli")
         db.append_message("solo", "user", "standalone")
-        db._conn.commit()
 
         sessions = db.list_sessions_rich(source="cli", limit=20)
         ids = [s["id"] for s in sessions]
@@ -1597,9 +1544,8 @@ class TestCompressionChainProjection:
         # if we used tip.started_at, but below if we correctly use root.started_at.
         t_between = t0 + 120  # between root1 and its compression
         db.create_session("newer", "cli")
-        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t_between, "newer"))
+        _session_update(db, "newer", started_at=t_between)
         db.append_message("newer", "user", "newer session started after root1")
-        db._conn.commit()
 
         sessions = db.list_sessions_rich(source="cli", limit=20)
         ids_in_order = [s["id"] for s in sessions]
@@ -1615,12 +1561,8 @@ class TestCompressionChainProjection:
         import time as _time
         t0 = _time.time() - 100
         db.create_session("orphan", "cli")
-        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0, "orphan"))
-        db._conn.execute(
-            "UPDATE sessions SET ended_at=?, end_reason=? WHERE id=?",
-            (t0 + 10, "compression", "orphan"),
-        )
-        db._conn.commit()
+        _session_update(db, "orphan", started_at=t0)
+        _session_update(db, "orphan", ended_at=t0 + 10, end_reason="compression")
 
         sessions = db.list_sessions_rich(source="cli", limit=10)
         ids = [s["id"] for s in sessions]
@@ -1780,17 +1722,8 @@ class TestConcurrentWriteSafety:
         assert len(msgs) == 1
         assert msgs[0]["content"] == "hello after lock"
 
-    def test_sqlite_timeout_is_at_least_30s(self, db):
-        """Connection timeout should be >= 30s to survive CLI/gateway contention."""
-        # Access the underlying connection timeout via sqlite3 introspection.
-        # There is no public API, so we check the kwarg via the module default.
-        import sqlite3
-        import inspect
-        from hermes_state import SessionDB as _SessionDB
-        src = inspect.getsource(_SessionDB.__init__)
-        assert "30" in src, (
-            "SQLite timeout should be at least 30s to handle CLI/gateway lock contention"
-        )
+    def test_engine_is_mysql(self, db):
+        assert str(db._engine.url).startswith("mysql")
 
 
 # =========================================================================
@@ -1814,10 +1747,9 @@ class TestStateMeta:
 
 class TestVacuum:
     def test_vacuum_runs_without_error(self, db):
-        """VACUUM must succeed on a fresh DB (no rows to reclaim)."""
+        """vacuum() is a no-op on MySQL but must not raise."""
         db.create_session(session_id="s1", source="cli")
         db.append_message(session_id="s1", role="user", content="hi")
-        # Should not raise, even though there's nothing significant to reclaim.
         db.vacuum()
 
 
@@ -1826,11 +1758,7 @@ class TestAutoMaintenance:
         """Create a session that is ended and was started `days_old` days ago."""
         db.create_session(session_id=sid, source="cli")
         db.end_session(sid, end_reason="done")
-        db._conn.execute(
-            "UPDATE sessions SET started_at = ? WHERE id = ?",
-            (time.time() - days_old * 86400, sid),
-        )
-        db._conn.commit()
+        _session_update(db, sid, started_at=time.time() - days_old * 86400)
 
     def test_first_run_prunes_and_vacuums(self, db):
         self._make_old_ended(db, "old1", days_old=100)

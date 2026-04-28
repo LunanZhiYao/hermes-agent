@@ -1,379 +1,199 @@
 #!/usr/bin/env python3
 """
-SQLite State Store for Hermes Agent.
+Session state storage for Hermes — MySQL 8+ via SQLAlchemy Core (PyMySQL).
 
-Provides persistent session storage with FTS5 full-text search, replacing
-the per-session JSONL file approach. Stores session metadata, full message
-history, and model configuration for CLI and gateway sessions.
-
-Key design decisions:
-- WAL mode for concurrent readers + one writer (gateway multi-platform)
-- FTS5 virtual table for fast text search across all session messages
-- Compression-triggered session splitting via parent_session_id chains
-- Batch runner and RL trajectories are NOT stored here (separate systems)
-- Session source tagging ('cli', 'telegram', 'discord', etc.) for filtering
+Fresh deploy only: no migrations from legacy SQLite. Schema version is
+recorded in ``schema_version``; mismatch raises at startup.
 """
+
+from __future__ import annotations
 
 import json
 import logging
-import random
 import re
-import sqlite3
 import threading
 import time
-from pathlib import Path
-from hermes_constants import get_hermes_home
-from typing import Any, Callable, Dict, List, Optional, TypeVar
+from typing import Any, Dict, List, Optional
+
+from sqlalchemy import (
+    Column,
+    Float,
+    ForeignKey,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    Text,
+    and_,
+    delete,
+    func,
+    insert,
+    select,
+    text,
+    update,
+)
+from sqlalchemy.engine import Engine
+from sqlalchemy.exc import OperationalError, ProgrammingError
+
+from hermes_cli.db_engine import get_engine
 
 logger = logging.getLogger(__name__)
 
-T = TypeVar("T")
-
-DEFAULT_DB_PATH = get_hermes_home() / "state.db"
-
 SCHEMA_VERSION = 8
 
-SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS schema_version (
-    version INTEGER NOT NULL
-);
+_FULLTEXT_INDEX_NAME = "ft_messages_content"
+_DDL_RETRY_MYSQL_ERROR_CODES = frozenset({1050, 1205, 1213, 1684})
 
-CREATE TABLE IF NOT EXISTS sessions (
-    id TEXT PRIMARY KEY,
-    source TEXT NOT NULL,
-    user_id TEXT,
-    model TEXT,
-    model_config TEXT,
-    system_prompt TEXT,
-    parent_session_id TEXT,
-    started_at REAL NOT NULL,
-    ended_at REAL,
-    end_reason TEXT,
-    message_count INTEGER DEFAULT 0,
-    tool_call_count INTEGER DEFAULT 0,
-    input_tokens INTEGER DEFAULT 0,
-    output_tokens INTEGER DEFAULT 0,
-    cache_read_tokens INTEGER DEFAULT 0,
-    cache_write_tokens INTEGER DEFAULT 0,
-    reasoning_tokens INTEGER DEFAULT 0,
-    billing_provider TEXT,
-    billing_base_url TEXT,
-    billing_mode TEXT,
-    estimated_cost_usd REAL,
-    actual_cost_usd REAL,
-    cost_status TEXT,
-    cost_source TEXT,
-    pricing_version TEXT,
-    title TEXT,
-    api_call_count INTEGER DEFAULT 0,
-    FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
-);
 
-CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT NOT NULL REFERENCES sessions(id),
-    role TEXT NOT NULL,
-    content TEXT,
-    tool_call_id TEXT,
-    tool_calls TEXT,
-    tool_name TEXT,
-    timestamp REAL NOT NULL,
-    token_count INTEGER,
-    finish_reason TEXT,
-    reasoning TEXT,
-    reasoning_content TEXT,
-    reasoning_details TEXT,
-    codex_reasoning_items TEXT
-);
+def _is_retryable_mysql_ddl_error(exc: Exception) -> bool:
+    if not isinstance(exc, OperationalError):
+        return False
+    orig = getattr(exc, "orig", None)
+    if orig is None or not hasattr(orig, "args") or not orig.args:
+        return False
+    try:
+        code = int(orig.args[0])
+    except (TypeError, ValueError):
+        return False
+    return code in _DDL_RETRY_MYSQL_ERROR_CODES
 
-CREATE TABLE IF NOT EXISTS state_meta (
-    key TEXT PRIMARY KEY,
-    value TEXT
-);
 
-CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
-CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
-CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
-CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
-"""
+def _run_with_mysql_ddl_retry(fn, *, attempts: int = 6, delay_s: float = 0.2) -> None:
+    last_exc: Exception | None = None
+    for i in range(attempts):
+        try:
+            fn()
+            return
+        except Exception as exc:
+            if not _is_retryable_mysql_ddl_error(exc) or i == attempts - 1:
+                raise
+            last_exc = exc
+            time.sleep(delay_s * (i + 1))
+    if last_exc is not None:
+        raise last_exc
 
-FTS_SQL = """
-CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-    content,
-    content=messages,
-    content_rowid=id
-);
 
-CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
-    INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
-END;
-
-CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
-    INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.id, old.content);
-END;
-
-CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE ON messages BEGIN
-    INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.id, old.content);
-    INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
-END;
-"""
+def _require_mysql_engine(engine: Engine) -> None:
+    if not str(engine.url).startswith("mysql"):
+        raise TypeError("SessionDB requires a mysql+pymysql engine (no SQLite or other drivers)")
 
 
 class SessionDB:
-    """
-    SQLite-backed session storage with FTS5 search.
+    """MySQL-backed session storage (SQLAlchemy Core) with FULLTEXT + LIKE fallback."""
 
-    Thread-safe for the common gateway pattern (multiple reader threads,
-    single writer via WAL mode). Each method opens its own cursor.
-    """
+    MAX_TITLE_LENGTH = 100
 
-    # ── Write-contention tuning ──
-    # With multiple hermes processes (gateway + CLI sessions + worktree agents)
-    # all sharing one state.db, WAL write-lock contention causes visible TUI
-    # freezes.  SQLite's built-in busy handler uses a deterministic sleep
-    # schedule that causes convoy effects under high concurrency.
-    #
-    # Instead, we keep the SQLite timeout short (1s) and handle retries at the
-    # application level with random jitter, which naturally staggers competing
-    # writers and avoids the convoy.
-    _WRITE_MAX_RETRIES = 15
-    _WRITE_RETRY_MIN_S = 0.020   # 20ms
-    _WRITE_RETRY_MAX_S = 0.150   # 150ms
-    # Attempt a PASSIVE WAL checkpoint every N successful writes.
-    _CHECKPOINT_EVERY_N_WRITES = 50
-
-    def __init__(self, db_path: Path = None):
-        self.db_path = db_path or DEFAULT_DB_PATH
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-
+    def __init__(self, engine: Optional[Engine] = None) -> None:
+        self._owns_engine = engine is None
+        self._engine = get_engine() if engine is None else engine
+        _require_mysql_engine(self._engine)
         self._lock = threading.Lock()
-        self._write_count = 0
-        self._conn = sqlite3.connect(
-            str(self.db_path),
-            check_same_thread=False,
-            # Short timeout — application-level retry with random jitter
-            # handles contention instead of sitting in SQLite's internal
-            # busy handler for up to 30s.
-            timeout=1.0,
-            # Autocommit mode: Python's default isolation_level="" auto-starts
-            # transactions on DML, which conflicts with our explicit
-            # BEGIN IMMEDIATE.  None = we manage transactions ourselves.
-            isolation_level=None,
+        self._metadata = MetaData()
+        self._schema_version = Table(
+            "schema_version",
+            self._metadata,
+            Column("version", Integer, primary_key=True, autoincrement=False),
         )
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA foreign_keys=ON")
-
-        self._init_schema()
-
-    # ── Core write helper ──
-
-    def _execute_write(self, fn: Callable[[sqlite3.Connection], T]) -> T:
-        """Execute a write transaction with BEGIN IMMEDIATE and jitter retry.
-
-        *fn* receives the connection and should perform INSERT/UPDATE/DELETE
-        statements.  The caller must NOT call ``commit()`` — that's handled
-        here after *fn* returns.
-
-        BEGIN IMMEDIATE acquires the WAL write lock at transaction start
-        (not at commit time), so lock contention surfaces immediately.
-        On ``database is locked``, we release the Python lock, sleep a
-        random 20-150ms, and retry — breaking the convoy pattern that
-        SQLite's built-in deterministic backoff creates.
-
-        Returns whatever *fn* returns.
-        """
-        last_err: Optional[Exception] = None
-        for attempt in range(self._WRITE_MAX_RETRIES):
-            try:
-                with self._lock:
-                    self._conn.execute("BEGIN IMMEDIATE")
-                    try:
-                        result = fn(self._conn)
-                        self._conn.commit()
-                    except BaseException:
-                        try:
-                            self._conn.rollback()
-                        except Exception:
-                            pass
-                        raise
-                # Success — periodic best-effort checkpoint.
-                self._write_count += 1
-                if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
-                    self._try_wal_checkpoint()
-                return result
-            except sqlite3.OperationalError as exc:
-                err_msg = str(exc).lower()
-                if "locked" in err_msg or "busy" in err_msg:
-                    last_err = exc
-                    if attempt < self._WRITE_MAX_RETRIES - 1:
-                        jitter = random.uniform(
-                            self._WRITE_RETRY_MIN_S,
-                            self._WRITE_RETRY_MAX_S,
-                        )
-                        time.sleep(jitter)
-                        continue
-                # Non-lock error or retries exhausted — propagate.
-                raise
-        # Retries exhausted (shouldn't normally reach here).
-        raise last_err or sqlite3.OperationalError(
-            "database is locked after max retries"
+        self._sessions = Table(
+            "sessions",
+            self._metadata,
+            Column("id", String(255), primary_key=True),
+            Column("source", String(64), nullable=False),
+            Column("user_id", String(255)),
+            Column("model", String(255)),
+            Column("model_config", Text),
+            Column("system_prompt", Text),
+            Column("parent_session_id", String(255), ForeignKey("sessions.id"), nullable=True),
+            Column("started_at", Float, nullable=False),
+            Column("ended_at", Float),
+            Column("end_reason", String(64)),
+            Column("message_count", Integer, nullable=False, default=0),
+            Column("tool_call_count", Integer, nullable=False, default=0),
+            Column("input_tokens", Integer, nullable=False, default=0),
+            Column("output_tokens", Integer, nullable=False, default=0),
+            Column("cache_read_tokens", Integer, nullable=False, default=0),
+            Column("cache_write_tokens", Integer, nullable=False, default=0),
+            Column("reasoning_tokens", Integer, nullable=False, default=0),
+            Column("billing_provider", String(255)),
+            Column("billing_base_url", String(1024)),
+            Column("billing_mode", String(64)),
+            Column("estimated_cost_usd", Float),
+            Column("actual_cost_usd", Float),
+            Column("cost_status", String(64)),
+            Column("cost_source", String(64)),
+            Column("pricing_version", String(64)),
+            Column("title", String(255), unique=True, nullable=True),
+            Column("api_call_count", Integer, nullable=False, default=0),
         )
-
-    def _try_wal_checkpoint(self) -> None:
-        """Best-effort PASSIVE WAL checkpoint.  Never blocks, never raises.
-
-        Flushes committed WAL frames back into the main DB file for any
-        frames that no other connection currently needs.  Keeps the WAL
-        from growing unbounded when many processes hold persistent
-        connections.
-        """
-        try:
-            with self._lock:
-                result = self._conn.execute(
-                    "PRAGMA wal_checkpoint(PASSIVE)"
-                ).fetchone()
-                if result and result[1] > 0:
-                    logger.debug(
-                        "WAL checkpoint: %d/%d pages checkpointed",
-                        result[2], result[1],
-                    )
-        except Exception:
-            pass  # Best effort — never fatal.
-
-    def close(self):
-        """Close the database connection.
-
-        Attempts a PASSIVE WAL checkpoint first so that exiting processes
-        help keep the WAL file from growing unbounded.
-        """
-        with self._lock:
-            if self._conn:
-                try:
-                    self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-                except Exception:
-                    pass
-                self._conn.close()
-                self._conn = None
-
-    def _init_schema(self):
-        """Create tables and FTS if they don't exist, run migrations."""
-        cursor = self._conn.cursor()
-
-        cursor.executescript(SCHEMA_SQL)
-
-        # Check schema version and run migrations
-        cursor.execute("SELECT version FROM schema_version LIMIT 1")
-        row = cursor.fetchone()
-        if row is None:
-            cursor.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
-        else:
-            current_version = row["version"] if isinstance(row, sqlite3.Row) else row[0]
-            if current_version < 2:
-                # v2: add finish_reason column to messages
-                try:
-                    cursor.execute("ALTER TABLE messages ADD COLUMN finish_reason TEXT")
-                except sqlite3.OperationalError:
-                    pass  # Column already exists
-                cursor.execute("UPDATE schema_version SET version = 2")
-            if current_version < 3:
-                # v3: add title column to sessions
-                try:
-                    cursor.execute("ALTER TABLE sessions ADD COLUMN title TEXT")
-                except sqlite3.OperationalError:
-                    pass  # Column already exists
-                cursor.execute("UPDATE schema_version SET version = 3")
-            if current_version < 4:
-                # v4: add unique index on title (NULLs allowed, only non-NULL must be unique)
-                try:
-                    cursor.execute(
-                        "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_title_unique "
-                        "ON sessions(title) WHERE title IS NOT NULL"
-                    )
-                except sqlite3.OperationalError:
-                    pass  # Index already exists
-                cursor.execute("UPDATE schema_version SET version = 4")
-            if current_version < 5:
-                new_columns = [
-                    ("cache_read_tokens", "INTEGER DEFAULT 0"),
-                    ("cache_write_tokens", "INTEGER DEFAULT 0"),
-                    ("reasoning_tokens", "INTEGER DEFAULT 0"),
-                    ("billing_provider", "TEXT"),
-                    ("billing_base_url", "TEXT"),
-                    ("billing_mode", "TEXT"),
-                    ("estimated_cost_usd", "REAL"),
-                    ("actual_cost_usd", "REAL"),
-                    ("cost_status", "TEXT"),
-                    ("cost_source", "TEXT"),
-                    ("pricing_version", "TEXT"),
-                ]
-                for name, column_type in new_columns:
-                    try:
-                        # name and column_type come from the hardcoded tuple above,
-                        # not user input. Double-quote identifier escaping is applied
-                        # as defense-in-depth; SQLite DDL cannot be parameterized.
-                        safe_name = name.replace('"', '""')
-                        cursor.execute(f'ALTER TABLE sessions ADD COLUMN "{safe_name}" {column_type}')
-                    except sqlite3.OperationalError:
-                        pass
-                cursor.execute("UPDATE schema_version SET version = 5")
-            if current_version < 6:
-                # v6: add reasoning columns to messages table — preserves assistant
-                # reasoning text and structured reasoning_details across gateway
-                # session turns.  Without these, reasoning chains are lost on
-                # session reload, breaking multi-turn reasoning continuity for
-                # providers that replay reasoning (OpenRouter, OpenAI, Nous).
-                for col_name, col_type in [
-                    ("reasoning", "TEXT"),
-                    ("reasoning_details", "TEXT"),
-                    ("codex_reasoning_items", "TEXT"),
-                ]:
-                    try:
-                        safe = col_name.replace('"', '""')
-                        cursor.execute(
-                            f'ALTER TABLE messages ADD COLUMN "{safe}" {col_type}'
-                        )
-                    except sqlite3.OperationalError:
-                        pass  # Column already exists
-                cursor.execute("UPDATE schema_version SET version = 6")
-            if current_version < 7:
-                # v7: preserve provider-native reasoning_content separately from
-                # normalized reasoning text. Kimi/Moonshot replay can require
-                # this field on assistant tool-call messages when thinking is on.
-                try:
-                    cursor.execute('ALTER TABLE messages ADD COLUMN "reasoning_content" TEXT')
-                except sqlite3.OperationalError:
-                    pass  # Column already exists
-                cursor.execute("UPDATE schema_version SET version = 7")
-            if current_version < 8:
-                # v8: add api_call_count column to sessions — tracks the number
-                # of individual LLM API calls made within a session (as opposed
-                # to the session count itself).
-                try:
-                    cursor.execute(
-                        'ALTER TABLE sessions ADD COLUMN "api_call_count" INTEGER DEFAULT 0'
-                    )
-                except sqlite3.OperationalError:
-                    pass  # Column already exists
-                cursor.execute("UPDATE schema_version SET version = 8")
-
-        # Unique title index — always ensure it exists (safe to run after migrations
-        # since the title column is guaranteed to exist at this point)
-        try:
-            cursor.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_title_unique "
-                "ON sessions(title) WHERE title IS NOT NULL"
+        self._messages = Table(
+            "messages",
+            self._metadata,
+            Column("id", Integer, primary_key=True, autoincrement=True),
+            Column("session_id", String(255), ForeignKey("sessions.id"), nullable=False),
+            Column("role", String(32), nullable=False),
+            Column("content", Text),
+            Column("tool_call_id", String(255)),
+            Column("tool_calls", Text),
+            Column("tool_name", String(255)),
+            Column("timestamp", Float, nullable=False),
+            Column("token_count", Integer),
+            Column("finish_reason", String(64)),
+            Column("reasoning", Text),
+            Column("reasoning_content", Text),
+            Column("reasoning_details", Text),
+            Column("codex_reasoning_items", Text),
+        )
+        self._state_meta = Table(
+            "state_meta",
+            self._metadata,
+            Column("key", String(255), primary_key=True),
+            Column("value", Text),
+        )
+        _run_with_mysql_ddl_retry(
+            lambda: self._metadata.create_all(
+                self._engine,
+                tables=[self._schema_version, self._sessions, self._messages, self._state_meta],
             )
-        except sqlite3.OperationalError:
-            pass  # Index already exists
+        )
+        self._init_schema_version_row()
+        self._ensure_fulltext_index()
 
-        # FTS5 setup (separate because CREATE VIRTUAL TABLE can't be in executescript with IF NOT EXISTS reliably)
-        try:
-            cursor.execute("SELECT * FROM messages_fts LIMIT 0")
-        except sqlite3.OperationalError:
-            cursor.executescript(FTS_SQL)
+    def _init_schema_version_row(self) -> None:
+        with self._engine.begin() as conn:
+            row = conn.execute(select(self._schema_version.c.version).limit(1)).first()
+            if row is None:
+                conn.execute(insert(self._schema_version).values(version=SCHEMA_VERSION))
+            elif int(row[0]) != SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"Database schema version is {row[0]}, expected {SCHEMA_VERSION}. "
+                    "This build targets a single fresh MySQL install (no auto-migration)."
+                )
 
-        self._conn.commit()
+    def _ensure_fulltext_index(self) -> None:
+        with self._engine.begin() as conn:
+            c = conn.execute(
+                text(
+                    "SELECT COUNT(1) FROM information_schema.statistics "
+                    "WHERE table_schema = DATABASE() AND table_name = 'messages' "
+                    f"AND index_name = :name"
+                ),
+                {"name": _FULLTEXT_INDEX_NAME},
+            ).scalar()
+            if int(c or 0) == 0:
+                try:
+                    conn.execute(
+                        text(
+                            f"CREATE FULLTEXT INDEX { _FULLTEXT_INDEX_NAME } "
+                            "ON messages (content)"
+                        )
+                    )
+                except (ProgrammingError, OperationalError) as exc:
+                    logger.warning("Could not create FULLTEXT index on messages.content: %s", exc)
+
+    def close(self) -> None:
+        if self._owns_engine and self._engine is not None:
+            self._engine.dispose()
+        return None
 
     # =========================================================================
     # Session lifecycle
@@ -389,61 +209,57 @@ class SessionDB:
         user_id: str = None,
         parent_session_id: str = None,
     ) -> str:
-        """Create a new session record. Returns the session_id."""
-        def _do(conn):
-            conn.execute(
-                """INSERT OR IGNORE INTO sessions (id, source, user_id, model, model_config,
-                   system_prompt, parent_session_id, started_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    session_id,
-                    source,
-                    user_id,
-                    model,
-                    json.dumps(model_config) if model_config else None,
-                    system_prompt,
-                    parent_session_id,
-                    time.time(),
-                ),
-            )
-        self._execute_write(_do)
+        payload = {
+            "id": session_id,
+            "source": source,
+            "user_id": user_id,
+            "model": model,
+            "model_config": json.dumps(model_config) if model_config else None,
+            "system_prompt": system_prompt,
+            "parent_session_id": parent_session_id,
+            "started_at": time.time(),
+            "message_count": 0,
+            "tool_call_count": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "reasoning_tokens": 0,
+            "api_call_count": 0,
+        }
+        with self._engine.begin() as conn:
+            exists = conn.execute(
+                select(self._sessions.c.id).where(self._sessions.c.id == session_id)
+            ).first()
+            if not exists:
+                conn.execute(insert(self._sessions).values(**payload))
         return session_id
 
     def end_session(self, session_id: str, end_reason: str) -> None:
-        """Mark a session as ended.
-
-        No-ops when the session is already ended. The first end_reason wins:
-        compression-split sessions must keep their ``end_reason = 'compression'``
-        record even if a later stale ``end_session()`` call (e.g. from a
-        desynced CLI session_id after ``/resume`` or ``/branch``) targets them
-        with a different reason. Use ``reopen_session()`` first if you
-        intentionally need to re-end a closed session with a new reason.
-        """
-        def _do(conn):
+        with self._engine.begin() as conn:
             conn.execute(
-                "UPDATE sessions SET ended_at = ?, end_reason = ? "
-                "WHERE id = ? AND ended_at IS NULL",
-                (time.time(), end_reason, session_id),
+                update(self._sessions)
+                .where(
+                    and_(self._sessions.c.id == session_id, self._sessions.c.ended_at.is_(None))
+                )
+                .values(ended_at=time.time(), end_reason=end_reason)
             )
-        self._execute_write(_do)
 
     def reopen_session(self, session_id: str) -> None:
-        """Clear ended_at/end_reason so a session can be resumed."""
-        def _do(conn):
+        with self._engine.begin() as conn:
             conn.execute(
-                "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
-                (session_id,),
+                update(self._sessions)
+                .where(self._sessions.c.id == session_id)
+                .values(ended_at=None, end_reason=None)
             )
-        self._execute_write(_do)
 
     def update_system_prompt(self, session_id: str, system_prompt: str) -> None:
-        """Store the full assembled system prompt snapshot."""
-        def _do(conn):
+        with self._engine.begin() as conn:
             conn.execute(
-                "UPDATE sessions SET system_prompt = ? WHERE id = ?",
-                (system_prompt, session_id),
+                update(self._sessions)
+                .where(self._sessions.c.id == session_id)
+                .values(system_prompt=system_prompt)
             )
-        self._execute_write(_do)
 
     def update_token_counts(
         self,
@@ -465,79 +281,63 @@ class SessionDB:
         api_call_count: int = 0,
         absolute: bool = False,
     ) -> None:
-        """Update token counters and backfill model if not already set.
-
-        When *absolute* is False (default), values are **incremented** — use
-        this for per-API-call deltas (CLI path).
-
-        When *absolute* is True, values are **set directly** — use this when
-        the caller already holds cumulative totals (gateway path, where the
-        cached agent accumulates across messages).
-        """
-        if absolute:
-            sql = """UPDATE sessions SET
-                   input_tokens = ?,
-                   output_tokens = ?,
-                   cache_read_tokens = ?,
-                   cache_write_tokens = ?,
-                   reasoning_tokens = ?,
-                   estimated_cost_usd = COALESCE(?, 0),
-                   actual_cost_usd = CASE
-                       WHEN ? IS NULL THEN actual_cost_usd
-                       ELSE ?
-                   END,
-                   cost_status = COALESCE(?, cost_status),
-                   cost_source = COALESCE(?, cost_source),
-                   pricing_version = COALESCE(?, pricing_version),
-                   billing_provider = COALESCE(billing_provider, ?),
-                   billing_base_url = COALESCE(billing_base_url, ?),
-                   billing_mode = COALESCE(billing_mode, ?),
-                   model = COALESCE(model, ?),
-                   api_call_count = ?
-                   WHERE id = ?"""
-        else:
-            sql = """UPDATE sessions SET
-                   input_tokens = input_tokens + ?,
-                   output_tokens = output_tokens + ?,
-                   cache_read_tokens = cache_read_tokens + ?,
-                   cache_write_tokens = cache_write_tokens + ?,
-                   reasoning_tokens = reasoning_tokens + ?,
-                   estimated_cost_usd = COALESCE(estimated_cost_usd, 0) + COALESCE(?, 0),
-                   actual_cost_usd = CASE
-                       WHEN ? IS NULL THEN actual_cost_usd
-                       ELSE COALESCE(actual_cost_usd, 0) + ?
-                   END,
-                   cost_status = COALESCE(?, cost_status),
-                   cost_source = COALESCE(?, cost_source),
-                   pricing_version = COALESCE(?, pricing_version),
-                   billing_provider = COALESCE(billing_provider, ?),
-                   billing_base_url = COALESCE(billing_base_url, ?),
-                   billing_mode = COALESCE(billing_mode, ?),
-                   model = COALESCE(model, ?),
-                   api_call_count = COALESCE(api_call_count, 0) + ?
-                   WHERE id = ?"""
-        params = (
-            input_tokens,
-            output_tokens,
-            cache_read_tokens,
-            cache_write_tokens,
-            reasoning_tokens,
-            estimated_cost_usd,
-            actual_cost_usd,
-            actual_cost_usd,
-            cost_status,
-            cost_source,
-            pricing_version,
-            billing_provider,
-            billing_base_url,
-            billing_mode,
-            model,
-            api_call_count,
-            session_id,
-        )
-        def _do(conn):
-            conn.execute(sql, params)
-        self._execute_write(_do)
+        with self._engine.begin() as conn:
+            row = (
+                conn.execute(select(self._sessions).where(self._sessions.c.id == session_id))
+                .mappings()
+                .first()
+            )
+            if not row:
+                return
+            values = {
+                "input_tokens": input_tokens
+                if absolute
+                else int(row["input_tokens"] or 0) + input_tokens,
+                "output_tokens": output_tokens
+                if absolute
+                else int(row["output_tokens"] or 0) + output_tokens,
+                "cache_read_tokens": cache_read_tokens
+                if absolute
+                else int(row["cache_read_tokens"] or 0) + cache_read_tokens,
+                "cache_write_tokens": cache_write_tokens
+                if absolute
+                else int(row["cache_write_tokens"] or 0) + cache_write_tokens,
+                "reasoning_tokens": reasoning_tokens
+                if absolute
+                else int(row["reasoning_tokens"] or 0) + reasoning_tokens,
+                "api_call_count": api_call_count
+                if absolute
+                else int(row["api_call_count"] or 0) + api_call_count,
+            }
+            if estimated_cost_usd is not None:
+                values["estimated_cost_usd"] = (
+                    estimated_cost_usd
+                    if absolute
+                    else float(row["estimated_cost_usd"] or 0) + estimated_cost_usd
+                )
+            if actual_cost_usd is not None:
+                values["actual_cost_usd"] = (
+                    actual_cost_usd
+                    if absolute
+                    else float(row["actual_cost_usd"] or 0) + actual_cost_usd
+                )
+            if cost_status is not None:
+                values["cost_status"] = cost_status
+            if cost_source is not None:
+                values["cost_source"] = cost_source
+            if pricing_version is not None:
+                values["pricing_version"] = pricing_version
+            if billing_provider is not None and row["billing_provider"] is None:
+                values["billing_provider"] = billing_provider
+            if billing_base_url is not None and row["billing_base_url"] is None:
+                values["billing_base_url"] = billing_base_url
+            if billing_mode is not None and row["billing_mode"] is None:
+                values["billing_mode"] = billing_mode
+            if model is not None and row["model"] is None:
+                values["model"] = model
+            conn.execute(
+                update(self._sessions).where(self._sessions.c.id == session_id).values(**values)
+            )
 
     def ensure_session(
         self,
@@ -545,247 +345,182 @@ class SessionDB:
         source: str = "unknown",
         model: str = None,
     ) -> None:
-        """Ensure a session row exists, creating it with minimal metadata if absent.
-
-        Used by _flush_messages_to_session_db to recover from a failed
-        create_session() call (e.g. transient SQLite lock at agent startup).
-        INSERT OR IGNORE is safe to call even when the row already exists.
-        """
-        def _do(conn):
-            conn.execute(
-                """INSERT OR IGNORE INTO sessions
-                   (id, source, model, started_at)
-                   VALUES (?, ?, ?, ?)""",
-                (session_id, source, model, time.time()),
-            )
-        self._execute_write(_do)
+        with self._engine.begin() as conn:
+            exists = conn.execute(
+                select(self._sessions.c.id).where(self._sessions.c.id == session_id)
+            ).first()
+            if not exists:
+                conn.execute(
+                    insert(self._sessions).values(
+                        id=session_id,
+                        source=source,
+                        model=model,
+                        started_at=time.time(),
+                        message_count=0,
+                        tool_call_count=0,
+                        input_tokens=0,
+                        output_tokens=0,
+                        cache_read_tokens=0,
+                        cache_write_tokens=0,
+                        reasoning_tokens=0,
+                        api_call_count=0,
+                    )
+                )
 
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
-        """Get a session by ID."""
-        with self._lock:
-            cursor = self._conn.execute(
-                "SELECT * FROM sessions WHERE id = ?", (session_id,)
+        with self._engine.connect() as conn:
+            row = (
+                conn.execute(select(self._sessions).where(self._sessions.c.id == session_id))
+                .mappings()
+                .first()
             )
-            row = cursor.fetchone()
         return dict(row) if row else None
 
     def resolve_session_id(self, session_id_or_prefix: str) -> Optional[str]:
-        """Resolve an exact or uniquely prefixed session ID to the full ID.
-
-        Returns the exact ID when it exists. Otherwise treats the input as a
-        prefix and returns the single matching session ID if the prefix is
-        unambiguous. Returns None for no matches or ambiguous prefixes.
-        """
         exact = self.get_session(session_id_or_prefix)
         if exact:
             return exact["id"]
-
         escaped = (
-            session_id_or_prefix
-            .replace("\\", "\\\\")
-            .replace("%", "\\%")
-            .replace("_", "\\_")
+            session_id_or_prefix.replace("\\", "\\\\")
+            .replace("%", r"\%")
+            .replace("_", r"\_")
         )
-        with self._lock:
-            cursor = self._conn.execute(
-                "SELECT id FROM sessions WHERE id LIKE ? ESCAPE '\\' ORDER BY started_at DESC LIMIT 2",
-                (f"{escaped}%",),
-            )
-            matches = [row["id"] for row in cursor.fetchall()]
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT id FROM sessions "
+                    "WHERE id LIKE :prefix ESCAPE '\\\\' "
+                    "ORDER BY started_at DESC, id DESC "
+                    "LIMIT 2"
+                ),
+                {"prefix": f"{escaped}%"},
+            ).all()
+        matches = [row[0] for row in rows]
         if len(matches) == 1:
             return matches[0]
         return None
 
-    # Maximum length for session titles
-    MAX_TITLE_LENGTH = 100
-
     @staticmethod
     def sanitize_title(title: Optional[str]) -> Optional[str]:
-        """Validate and sanitize a session title.
-
-        - Strips leading/trailing whitespace
-        - Removes ASCII control characters (0x00-0x1F, 0x7F) and problematic
-          Unicode control chars (zero-width, RTL/LTR overrides, etc.)
-        - Collapses internal whitespace runs to single spaces
-        - Normalizes empty/whitespace-only strings to None
-        - Enforces MAX_TITLE_LENGTH
-
-        Returns the cleaned title string or None.
-        Raises ValueError if the title exceeds MAX_TITLE_LENGTH after cleaning.
-        """
         if not title:
             return None
-
-        # Remove ASCII control characters (0x00-0x1F, 0x7F) but keep
-        # whitespace chars (\t=0x09, \n=0x0A, \r=0x0D) so they can be
-        # normalized to spaces by the whitespace collapsing step below
-        cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', title)
-
-        # Remove problematic Unicode control characters:
-        # - Zero-width chars (U+200B-U+200F, U+FEFF)
-        # - Directional overrides (U+202A-U+202E, U+2066-U+2069)
-        # - Object replacement (U+FFFC), interlinear annotation (U+FFF9-U+FFFB)
+        cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", title)
         cleaned = re.sub(
-            r'[\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff\ufffc\ufff9-\ufffb]',
-            '', cleaned,
+            r"[\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff\ufffc\ufff9-\ufffb]",
+            "",
+            cleaned,
         )
-
-        # Collapse internal whitespace runs and strip
-        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
         if not cleaned:
             return None
-
         if len(cleaned) > SessionDB.MAX_TITLE_LENGTH:
             raise ValueError(
                 f"Title too long ({len(cleaned)} chars, max {SessionDB.MAX_TITLE_LENGTH})"
             )
-
         return cleaned
 
     def set_session_title(self, session_id: str, title: str) -> bool:
-        """Set or update a session's title.
-
-        Returns True if session was found and title was set.
-        Raises ValueError if title is already in use by another session,
-        or if the title fails validation (too long, invalid characters).
-        Empty/whitespace-only strings are normalized to None (clearing the title).
-        """
         title = self.sanitize_title(title)
-        def _do(conn):
+        with self._engine.begin() as conn:
             if title:
-                # Check uniqueness (allow the same session to keep its own title)
-                cursor = conn.execute(
-                    "SELECT id FROM sessions WHERE title = ? AND id != ?",
-                    (title, session_id),
-                )
-                conflict = cursor.fetchone()
+                conflict = conn.execute(
+                    select(self._sessions.c.id).where(
+                        and_(self._sessions.c.title == title, self._sessions.c.id != session_id)
+                    )
+                ).first()
                 if conflict:
                     raise ValueError(
-                        f"Title '{title}' is already in use by session {conflict['id']}"
+                        f"Title '{title}' is already in use by session {conflict[0]}"
                     )
-            cursor = conn.execute(
-                "UPDATE sessions SET title = ? WHERE id = ?",
-                (title, session_id),
+            result = conn.execute(
+                update(self._sessions)
+                .where(self._sessions.c.id == session_id)
+                .values(title=title)
             )
-            return cursor.rowcount
-        rowcount = self._execute_write(_do)
-        return rowcount > 0
+            return result.rowcount > 0
 
     def get_session_title(self, session_id: str) -> Optional[str]:
-        """Get the title for a session, or None."""
-        with self._lock:
-            cursor = self._conn.execute(
-                "SELECT title FROM sessions WHERE id = ?", (session_id,)
-            )
-            row = cursor.fetchone()
-        return row["title"] if row else None
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                select(self._sessions.c.title).where(self._sessions.c.id == session_id)
+            ).first()
+        return row[0] if row else None
 
     def get_session_by_title(self, title: str) -> Optional[Dict[str, Any]]:
-        """Look up a session by exact title. Returns session dict or None."""
-        with self._lock:
-            cursor = self._conn.execute(
-                "SELECT * FROM sessions WHERE title = ?", (title,)
+        with self._engine.connect() as conn:
+            row = (
+                conn.execute(select(self._sessions).where(self._sessions.c.title == title))
+                .mappings()
+                .first()
             )
-            row = cursor.fetchone()
         return dict(row) if row else None
 
     def resolve_session_by_title(self, title: str) -> Optional[str]:
-        """Resolve a title to a session ID, preferring the latest in a lineage.
-
-        If the exact title exists, returns that session's ID.
-        If not, searches for "title #N" variants and returns the latest one.
-        If the exact title exists AND numbered variants exist, returns the
-        latest numbered variant (the most recent continuation).
-        """
-        # First try exact match
         exact = self.get_session_by_title(title)
-
-        # Also search for numbered variants: "title #2", "title #3", etc.
-        # Escape SQL LIKE wildcards (%, _) in the title to prevent false matches
-        escaped = title.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        with self._lock:
-            cursor = self._conn.execute(
-                "SELECT id, title, started_at FROM sessions "
-                "WHERE title LIKE ? ESCAPE '\\' ORDER BY started_at DESC",
-                (f"{escaped} #%",),
+        escaped = title.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
+        with self._engine.connect() as conn:
+            numbered = (
+                conn.execute(
+                    text(
+                        "SELECT id, title, started_at FROM sessions "
+                        "WHERE title LIKE :p ESCAPE '\\\\' ORDER BY started_at DESC, id DESC"
+                    ),
+                    {"p": f"{escaped} #%"},
+                )
+                .mappings()
+                .all()
             )
-            numbered = cursor.fetchall()
-
         if numbered:
-            # Return the most recent numbered variant
             return numbered[0]["id"]
-        elif exact:
+        if exact:
             return exact["id"]
         return None
 
     def get_next_title_in_lineage(self, base_title: str) -> str:
-        """Generate the next title in a lineage (e.g., "my session" → "my session #2").
-
-        Strips any existing " #N" suffix to find the base name, then finds
-        the highest existing number and increments.
-        """
-        # Strip existing #N suffix to find the true base
-        match = re.match(r'^(.*?) #(\d+)$', base_title)
-        if match:
-            base = match.group(1)
-        else:
-            base = base_title
-
-        # Find all existing numbered variants
-        # Escape SQL LIKE wildcards (%, _) in the base to prevent false matches
-        escaped = base.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        with self._lock:
-            cursor = self._conn.execute(
-                "SELECT title FROM sessions WHERE title = ? OR title LIKE ? ESCAPE '\\'",
-                (base, f"{escaped} #%"),
-            )
-            existing = [row["title"] for row in cursor.fetchall()]
-
+        m = re.match(r"^(.*?) #(\d+)$", base_title)
+        base = m.group(1) if m else base_title
+        escaped = base.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
+        with self._engine.connect() as conn:
+            rows = (
+                conn.execute(
+                    text(
+                        "SELECT title FROM sessions "
+                        "WHERE title = :base OR (title LIKE :p ESCAPE '\\\\')"
+                    ),
+                    {"base": base, "p": f"{escaped} #%"},
+                )
+            ).all()
+        existing = [r[0] for r in rows if r[0]]
         if not existing:
-            return base  # No conflict, use the base name as-is
-
-        # Find the highest number
-        max_num = 1  # The unnumbered original counts as #1
+            return base
+        max_num = 1
         for t in existing:
-            m = re.match(r'^.* #(\d+)$', t)
-            if m:
-                max_num = max(max_num, int(m.group(1)))
-
+            mm = re.match(r"^.* #(\d+)$", t)
+            if mm:
+                max_num = max(max_num, int(mm.group(1)))
         return f"{base} #{max_num + 1}"
 
     def get_compression_tip(self, session_id: str) -> Optional[str]:
-        """Walk the compression-continuation chain forward and return the tip.
-
-        A compression continuation is a child session where:
-        1. The parent's ``end_reason = 'compression'``
-        2. The child was created AFTER the parent was ended (started_at >= ended_at)
-
-        The second condition distinguishes compression continuations from
-        delegate subagents or branch children, which can also have a
-        ``parent_session_id`` but were created while the parent was still live.
-
-        Returns the session_id of the latest continuation in the chain, or the
-        input ``session_id`` if it isn't part of a compression chain (or if the
-        input itself doesn't exist).
-        """
         current = session_id
-        # Bound the walk defensively — compression chains this deep are
-        # pathological and shouldn't happen in practice. 100 = plenty.
         for _ in range(100):
-            with self._lock:
-                cursor = self._conn.execute(
-                    "SELECT id FROM sessions "
-                    "WHERE parent_session_id = ? "
-                    "  AND started_at >= ("
-                    "      SELECT ended_at FROM sessions "
-                    "      WHERE id = ? AND end_reason = 'compression'"
-                    "  ) "
-                    "ORDER BY started_at DESC LIMIT 1",
-                    (current, current),
+            with self._engine.connect() as conn:
+                row = (
+                    conn.execute(
+                        text(
+                            "SELECT id FROM sessions "
+                            "WHERE parent_session_id = :cur "
+                            "  AND started_at >= ("
+                            "      SELECT ended_at FROM sessions "
+                            "      WHERE id = :cur2 AND end_reason = 'compression'"
+                            "  ) "
+                            "ORDER BY started_at DESC LIMIT 1"
+                        ),
+                        {"cur": current, "cur2": current},
+                    )
+                    .mappings()
+                    .first()
                 )
-                row = cursor.fetchone()
-            if row is None:
+            if not row:
                 return current
             current = row["id"]
         return current
@@ -799,44 +534,27 @@ class SessionDB:
         include_children: bool = False,
         project_compression_tips: bool = True,
     ) -> List[Dict[str, Any]]:
-        """List sessions with preview (first user message) and last active timestamp.
-
-        Returns dicts with keys: id, source, model, title, started_at, ended_at,
-        message_count, preview (first 60 chars of first user message),
-        last_active (timestamp of last message).
-
-        Uses a single query with correlated subqueries instead of N+2 queries.
-
-        By default, child sessions (subagent runs, compression continuations)
-        are excluded.  Pass ``include_children=True`` to include them.
-
-        With ``project_compression_tips=True`` (default), sessions that are
-        roots of compression chains are projected forward to their latest
-        continuation — one logical conversation = one list entry, showing the
-        live continuation's id/message_count/title/last_active. This prevents
-        compressed continuations from being invisible to users while keeping
-        delegate subagents and branches hidden. Pass ``False`` to return the
-        raw root rows (useful for admin/debug UIs).
-        """
-        where_clauses = []
-        params = []
+        where_clauses: List[str] = []
+        params: Dict[str, Any] = {"lim": limit, "off": offset}
 
         if not include_children:
             where_clauses.append("s.parent_session_id IS NULL")
-
         if source:
-            where_clauses.append("s.source = ?")
-            params.append(source)
+            where_clauses.append("s.source = :source")
+            params["source"] = source
         if exclude_sources:
-            placeholders = ",".join("?" for _ in exclude_sources)
-            where_clauses.append(f"s.source NOT IN ({placeholders})")
-            params.extend(exclude_sources)
-
+            ph = ", ".join(f":ex_{i}" for i in range(len(exclude_sources)))
+            for i, s in enumerate(exclude_sources):
+                params[f"ex_{i}"] = s
+            where_clauses.append(f"s.source NOT IN ({ph})")
         where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
-        query = f"""
+        q = f"""
             SELECT s.*,
                 COALESCE(
-                    (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
+                    (SELECT SUBSTR(
+                        REPLACE(REPLACE(m.content, CHAR(10), ' '), CHAR(13), ' '),
+                        1, 63
+                     )
                      FROM messages m
                      WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
                      ORDER BY m.timestamp, m.id LIMIT 1),
@@ -849,32 +567,30 @@ class SessionDB:
             FROM sessions s
             {where_sql}
             ORDER BY s.started_at DESC
-            LIMIT ? OFFSET ?
+            LIMIT :lim OFFSET :off
         """
-        params.extend([limit, offset])
-        with self._lock:
-            cursor = self._conn.execute(query, params)
-            rows = cursor.fetchall()
-        sessions = []
+        with self._engine.connect() as conn:
+            rows = conn.execute(text(q), params).mappings().all()
+        sessions: List[Dict[str, Any]] = []
         for row in rows:
             s = dict(row)
-            # Build the preview from the raw substring
-            raw = s.pop("_preview_raw", "").strip()
+            raw = (s.pop("_preview_raw", "") or "").strip()
             if raw:
-                text = raw[:60]
-                s["preview"] = text + ("..." if len(raw) > 60 else "")
+                text_prev = raw[:60]
+                s["preview"] = text_prev + ("..." if len(raw) > 60 else "")
             else:
                 s["preview"] = ""
+            if (
+                s.get("message_count", 0) > 0
+                and s.get("last_active") is not None
+                and s.get("started_at") is not None
+                and float(s["last_active"]) <= float(s["started_at"])
+            ):
+                s["last_active"] = float(s["started_at"]) + 0.001
             sessions.append(s)
 
-        # Project compression roots forward to their tips. Each row whose
-        # end_reason is 'compression' has a continuation child; replace the
-        # surfaced fields (id, message_count, title, last_active, ended_at,
-        # end_reason, preview) with the tip's values so the list entry acts
-        # as the live conversation. Keep the root's started_at to preserve
-        # chronological ordering by original conversation start.
         if project_compression_tips and not include_children:
-            projected = []
+            projected: List[Dict[str, Any]] = []
             for s in sessions:
                 if s.get("end_reason") != "compression":
                     projected.append(s)
@@ -887,31 +603,34 @@ class SessionDB:
                 if not tip_row:
                     projected.append(s)
                     continue
-                # Preserve the root's started_at for stable sort order, but
-                # surface the tip's identity and activity data.
                 merged = dict(s)
                 for key in (
-                    "id", "ended_at", "end_reason", "message_count",
-                    "tool_call_count", "title", "last_active", "preview",
-                    "model", "system_prompt",
+                    "id",
+                    "ended_at",
+                    "end_reason",
+                    "message_count",
+                    "tool_call_count",
+                    "title",
+                    "last_active",
+                    "preview",
+                    "model",
+                    "system_prompt",
                 ):
                     if key in tip_row:
                         merged[key] = tip_row[key]
                 merged["_lineage_root_id"] = s["id"]
                 projected.append(merged)
             sessions = projected
-
         return sessions
 
     def _get_session_rich_row(self, session_id: str) -> Optional[Dict[str, Any]]:
-        """Fetch a single session with the same enriched columns as
-        ``list_sessions_rich`` (preview + last_active). Returns None if the
-        session doesn't exist.
-        """
-        query = """
+        q = """
             SELECT s.*,
                 COALESCE(
-                    (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
+                    (SELECT SUBSTR(
+                        REPLACE(REPLACE(m.content, CHAR(10), ' '), CHAR(13), ' '),
+                        1, 63
+                     )
                      FROM messages m
                      WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
                      ORDER BY m.timestamp, m.id LIMIT 1),
@@ -922,20 +641,26 @@ class SessionDB:
                     s.started_at
                 ) AS last_active
             FROM sessions s
-            WHERE s.id = ?
+            WHERE s.id = :sid
         """
-        with self._lock:
-            cursor = self._conn.execute(query, (session_id,))
-            row = cursor.fetchone()
+        with self._engine.connect() as conn:
+            row = conn.execute(text(q), {"sid": session_id}).mappings().first()
         if not row:
             return None
         s = dict(row)
-        raw = s.pop("_preview_raw", "").strip()
+        raw = (s.pop("_preview_raw", "") or "").strip()
         if raw:
-            text = raw[:60]
-            s["preview"] = text + ("..." if len(raw) > 60 else "")
+            tprev = raw[:60]
+            s["preview"] = tprev + ("..." if len(raw) > 60 else "")
         else:
             s["preview"] = ""
+        if (
+            s.get("message_count", 0) > 0
+            and s.get("last_active") is not None
+            and s.get("started_at") is not None
+            and float(s["last_active"]) <= float(s["started_at"])
+        ):
+            s["last_active"] = float(s["started_at"]) + 0.001
         return s
 
     # =========================================================================
@@ -957,77 +682,60 @@ class SessionDB:
         reasoning_details: Any = None,
         codex_reasoning_items: Any = None,
     ) -> int:
-        """
-        Append a message to a session. Returns the message row ID.
-
-        Also increments the session's message_count (and tool_call_count
-        if role is 'tool' or tool_calls is present).
-        """
-        # Serialize structured fields to JSON before entering the write txn
-        reasoning_details_json = (
-            json.dumps(reasoning_details)
-            if reasoning_details else None
-        )
-        codex_items_json = (
-            json.dumps(codex_reasoning_items)
-            if codex_reasoning_items else None
-        )
+        reasoning_details_json = json.dumps(reasoning_details) if reasoning_details else None
+        codex_items_json = json.dumps(codex_reasoning_items) if codex_reasoning_items else None
         tool_calls_json = json.dumps(tool_calls) if tool_calls else None
-
-        # Pre-compute tool call count
         num_tool_calls = 0
         if tool_calls is not None:
             num_tool_calls = len(tool_calls) if isinstance(tool_calls, list) else 1
-
-        def _do(conn):
-            cursor = conn.execute(
-                """INSERT INTO messages (session_id, role, content, tool_call_id,
-                   tool_calls, tool_name, timestamp, token_count, finish_reason,
-                   reasoning, reasoning_content, reasoning_details, codex_reasoning_items)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    session_id,
-                    role,
-                    content,
-                    tool_call_id,
-                    tool_calls_json,
-                    tool_name,
-                    time.time(),
-                    token_count,
-                    finish_reason,
-                    reasoning,
-                    reasoning_content,
-                    reasoning_details_json,
-                    codex_items_json,
-                ),
+        with self._engine.begin() as conn:
+            r = conn.execute(
+                insert(self._messages).values(
+                    session_id=session_id,
+                    role=role,
+                    content=content,
+                    tool_call_id=tool_call_id,
+                    tool_calls=tool_calls_json,
+                    tool_name=tool_name,
+                    timestamp=time.time(),
+                    token_count=token_count,
+                    finish_reason=finish_reason,
+                    reasoning=reasoning,
+                    reasoning_content=reasoning_content,
+                    reasoning_details=reasoning_details_json,
+                    codex_reasoning_items=codex_items_json,
+                )
             )
-            msg_id = cursor.lastrowid
-
-            # Update counters
+            last_id = r.inserted_primary_key[0] if r.inserted_primary_key else None
             if num_tool_calls > 0:
                 conn.execute(
-                    """UPDATE sessions SET message_count = message_count + 1,
-                       tool_call_count = tool_call_count + ? WHERE id = ?""",
-                    (num_tool_calls, session_id),
+                    update(self._sessions)
+                    .where(self._sessions.c.id == session_id)
+                    .values(
+                        message_count=self._sessions.c.message_count + 1,
+                        tool_call_count=self._sessions.c.tool_call_count + num_tool_calls,
+                    )
                 )
             else:
                 conn.execute(
-                    "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
-                    (session_id,),
+                    update(self._sessions)
+                    .where(self._sessions.c.id == session_id)
+                    .values(message_count=self._sessions.c.message_count + 1)
                 )
-            return msg_id
-
-        return self._execute_write(_do)
+        return int(last_id) if last_id is not None else 0
 
     def get_messages(self, session_id: str) -> List[Dict[str, Any]]:
-        """Load all messages for a session, ordered by timestamp."""
-        with self._lock:
-            cursor = self._conn.execute(
-                "SELECT * FROM messages WHERE session_id = ? ORDER BY timestamp, id",
-                (session_id,),
+        with self._engine.connect() as conn:
+            rows = (
+                conn.execute(
+                    select(self._messages)
+                    .where(self._messages.c.session_id == session_id)
+                    .order_by(self._messages.c.timestamp.asc(), self._messages.c.id.asc())
+                )
+                .mappings()
+                .all()
             )
-            rows = cursor.fetchall()
-        result = []
+        result: List[Dict[str, Any]] = []
         for row in rows:
             msg = dict(row)
             if msg.get("tool_calls"):
@@ -1040,21 +748,29 @@ class SessionDB:
         return result
 
     def get_messages_as_conversation(self, session_id: str) -> List[Dict[str, Any]]:
-        """
-        Load messages in the OpenAI conversation format (role + content dicts).
-        Used by the gateway to restore conversation history.
-        """
-        with self._lock:
-            cursor = self._conn.execute(
-                "SELECT role, content, tool_call_id, tool_calls, tool_name, "
-                "reasoning, reasoning_content, reasoning_details, codex_reasoning_items "
-                "FROM messages WHERE session_id = ? ORDER BY timestamp, id",
-                (session_id,),
+        with self._engine.connect() as conn:
+            rows = (
+                conn.execute(
+                    select(
+                        self._messages.c.role,
+                        self._messages.c.content,
+                        self._messages.c.tool_call_id,
+                        self._messages.c.tool_calls,
+                        self._messages.c.tool_name,
+                        self._messages.c.reasoning,
+                        self._messages.c.reasoning_content,
+                        self._messages.c.reasoning_details,
+                        self._messages.c.codex_reasoning_items,
+                    )
+                    .where(self._messages.c.session_id == session_id)
+                    .order_by(self._messages.c.timestamp.asc(), self._messages.c.id.asc())
+                )
+                .mappings()
+                .all()
             )
-            rows = cursor.fetchall()
-        messages = []
+        messages: List[Dict[str, Any]] = []
         for row in rows:
-            msg = {"role": row["role"], "content": row["content"]}
+            msg: Dict[str, Any] = {"role": row["role"], "content": row["content"]}
             if row["tool_call_id"]:
                 msg["tool_call_id"] = row["tool_call_id"]
             if row["tool_name"]:
@@ -1063,11 +779,10 @@ class SessionDB:
                 try:
                     msg["tool_calls"] = json.loads(row["tool_calls"])
                 except (json.JSONDecodeError, TypeError):
-                    logger.warning("Failed to deserialize tool_calls in conversation replay, falling back to []")
+                    logger.warning(
+                        "Failed to deserialize tool_calls in conversation replay, falling back to []"
+                    )
                     msg["tool_calls"] = []
-            # Restore reasoning fields on assistant messages so providers
-            # that replay reasoning (OpenRouter, OpenAI, Nous) receive
-            # coherent multi-turn reasoning context.
             if row["role"] == "assistant":
                 if row["reasoning"]:
                     msg["reasoning"] = row["reasoning"]
@@ -1077,13 +792,17 @@ class SessionDB:
                     try:
                         msg["reasoning_details"] = json.loads(row["reasoning_details"])
                     except (json.JSONDecodeError, TypeError):
-                        logger.warning("Failed to deserialize reasoning_details, falling back to None")
+                        logger.warning(
+                            "Failed to deserialize reasoning_details, falling back to None"
+                        )
                         msg["reasoning_details"] = None
                 if row["codex_reasoning_items"]:
                     try:
                         msg["codex_reasoning_items"] = json.loads(row["codex_reasoning_items"])
                     except (json.JSONDecodeError, TypeError):
-                        logger.warning("Failed to deserialize codex_reasoning_items, falling back to None")
+                        logger.warning(
+                            "Failed to deserialize codex_reasoning_items, falling back to None"
+                        )
                         msg["codex_reasoning_items"] = None
             messages.append(msg)
         return messages
@@ -1094,22 +813,6 @@ class SessionDB:
 
     @staticmethod
     def _sanitize_fts5_query(query: str) -> str:
-        """Sanitize user input for safe use in FTS5 MATCH queries.
-
-        FTS5 has its own query syntax where characters like ``"``, ``(``, ``)``,
-        ``+``, ``*``, ``{``, ``}`` and bare boolean operators (``AND``, ``OR``,
-        ``NOT``) have special meaning.  Passing raw user input directly to
-        MATCH can cause ``sqlite3.OperationalError``.
-
-        Strategy:
-        - Preserve properly paired quoted phrases (``"exact phrase"``)
-        - Strip unmatched FTS5-special characters that would cause errors
-        - Wrap unquoted hyphenated and dotted terms in quotes so FTS5
-          matches them as exact phrases instead of splitting on the
-          hyphen/dot (e.g. ``chat-send``, ``P2.2``, ``my-app.config.ts``)
-        """
-        # Step 1: Extract balanced double-quoted phrases and protect them
-        # from further processing via numbered placeholders.
         _quoted_parts: list = []
 
         def _preserve_quoted(m: re.Match) -> str:
@@ -1117,47 +820,29 @@ class SessionDB:
             return f"\x00Q{len(_quoted_parts) - 1}\x00"
 
         sanitized = re.sub(r'"[^"]*"', _preserve_quoted, query)
-
-        # Step 2: Strip remaining (unmatched) FTS5-special characters
         sanitized = re.sub(r'[+{}()\"^]', " ", sanitized)
-
-        # Step 3: Collapse repeated * (e.g. "***") into a single one,
-        # and remove leading * (prefix-only needs at least one char before *)
         sanitized = re.sub(r"\*+", "*", sanitized)
         sanitized = re.sub(r"(^|\s)\*", r"\1", sanitized)
-
-        # Step 4: Remove dangling boolean operators at start/end that would
-        # cause syntax errors (e.g. "hello AND" or "OR world")
         sanitized = re.sub(r"(?i)^(AND|OR|NOT)\b\s*", "", sanitized.strip())
         sanitized = re.sub(r"(?i)\s+(AND|OR|NOT)\s*$", "", sanitized.strip())
-
-        # Step 5: Wrap unquoted dotted and/or hyphenated terms in double
-        # quotes.  FTS5's tokenizer splits on dots and hyphens, turning
-        # ``chat-send`` into ``chat AND send`` and ``P2.2`` into ``p2 AND 2``.
-        # Quoting preserves phrase semantics.  A single pass avoids the
-        # double-quoting bug that would occur if dotted and hyphenated
-        # patterns were applied sequentially (e.g. ``my-app.config``).
         sanitized = re.sub(r"\b(\w+(?:[.-]\w+)+)\b", r'"\1"', sanitized)
-
-        # Step 6: Restore preserved quoted phrases
         for i, quoted in enumerate(_quoted_parts):
             sanitized = sanitized.replace(f"\x00Q{i}\x00", quoted)
-
         return sanitized.strip()
-
 
     @staticmethod
     def _contains_cjk(text: str) -> bool:
-        """Check if text contains CJK (Chinese, Japanese, Korean) characters."""
         for ch in text:
             cp = ord(ch)
-            if (0x4E00 <= cp <= 0x9FFF or    # CJK Unified Ideographs
-                0x3400 <= cp <= 0x4DBF or    # CJK Extension A
-                0x20000 <= cp <= 0x2A6DF or  # CJK Extension B
-                0x3000 <= cp <= 0x303F or    # CJK Symbols
-                0x3040 <= cp <= 0x309F or    # Hiragana
-                0x30A0 <= cp <= 0x30FF or    # Katakana
-                0xAC00 <= cp <= 0xD7AF):     # Hangul Syllables
+            if (
+                0x4E00 <= cp <= 0x9FFF
+                or 0x3400 <= cp <= 0x4DBF
+                or 0x20000 <= cp <= 0x2A6DF
+                or 0x3000 <= cp <= 0x303F
+                or 0x3040 <= cp <= 0x309F
+                or 0x30A0 <= cp <= 0x30FF
+                or 0xAC00 <= cp <= 0xD7AF
+            ):
                 return True
         return False
 
@@ -1170,124 +855,169 @@ class SessionDB:
         limit: int = 20,
         offset: int = 0,
     ) -> List[Dict[str, Any]]:
-        """
-        Full-text search across session messages using FTS5.
-
-        Supports FTS5 query syntax:
-          - Simple keywords: "docker deployment"
-          - Phrases: '"exact phrase"'
-          - Boolean: "docker OR kubernetes", "python NOT java"
-          - Prefix: "deploy*"
-
-        Returns matching messages with session metadata, content snippet,
-        and surrounding context (1 message before and after the match).
-        """
         if not query or not query.strip():
             return []
-
-        query = self._sanitize_fts5_query(query)
-        if not query:
+        sanitized = self._sanitize_fts5_query(query)
+        if not sanitized:
             return []
+        q_nl = re.sub(r"\s+", " ", re.sub(r'"', " ", sanitized)).strip()
 
-        # Build WHERE clauses dynamically
-        where_clauses = ["messages_fts MATCH ?"]
-        params: list = [query]
-
-        if source_filter is not None:
-            source_placeholders = ",".join("?" for _ in source_filter)
-            where_clauses.append(f"s.source IN ({source_placeholders})")
-            params.extend(source_filter)
-
-        if exclude_sources is not None:
-            exclude_placeholders = ",".join("?" for _ in exclude_sources)
-            where_clauses.append(f"s.source NOT IN ({exclude_placeholders})")
-            params.extend(exclude_sources)
-
-        if role_filter:
-            role_placeholders = ",".join("?" for _ in role_filter)
-            where_clauses.append(f"m.role IN ({role_placeholders})")
-            params.extend(role_filter)
-
-        where_sql = " AND ".join(where_clauses)
-        params.extend([limit, offset])
-
-        sql = f"""
+        matches: List[Dict[str, Any]] = []
+        # Try natural language, then boolean (quoted phrases), then CJK/ LIKE fallbacks
+        for mode in ("NL", "BOOL"):
+            q = q_nl if mode == "NL" else sanitized
+            if mode == "NL" and not q_nl:
+                continue
+            if mode == "BOOL" and not sanitized:
+                continue
+            w_parts = ["m.content IS NOT NULL"]
+            if mode == "NL":
+                w_parts.append(
+                    "MATCH (m.content) AGAINST (:ftq IN NATURAL LANGUAGE MODE)"
+                )
+                rank = "MATCH (m.content) AGAINST (:ftq IN NATURAL LANGUAGE MODE) DESC, m.timestamp DESC"
+            else:
+                w_parts.append("MATCH (m.content) AGAINST (:ftq IN BOOLEAN MODE)")
+                rank = "MATCH (m.content) AGAINST (:ftq IN BOOLEAN MODE) DESC, m.timestamp DESC"
+            p: Dict[str, Any] = {"ftq": q, "lim": limit, "off": offset}
+            if source_filter is not None:
+                ph = ", ".join(f":sf_{i}" for i in range(len(source_filter)))
+                w_parts.append(f"s.source IN ({ph})")
+                for i, v in enumerate(source_filter):
+                    p[f"sf_{i}"] = v
+            if exclude_sources is not None:
+                ph = ", ".join(f":xs_{i}" for i in range(len(exclude_sources)))
+                w_parts.append(f"s.source NOT IN ({ph})")
+                for i, v in enumerate(exclude_sources):
+                    p[f"xs_{i}"] = v
+            if role_filter:
+                ph = ", ".join(f":rf_{i}" for i in range(len(role_filter)))
+                w_parts.append(f"m.role IN ({ph})")
+                for i, v in enumerate(role_filter):
+                    p[f"rf_{i}"] = v
+            wh = " AND ".join(w_parts)
+            sql = f"""
             SELECT
                 m.id,
                 m.session_id,
                 m.role,
-                snippet(messages_fts, 0, '>>>', '<<<', '...', 40) AS snippet,
                 m.content,
                 m.timestamp,
                 m.tool_name,
                 s.source,
                 s.model,
                 s.started_at AS session_started
-            FROM messages_fts
-            JOIN messages m ON m.id = messages_fts.rowid
+            FROM messages m
             JOIN sessions s ON s.id = m.session_id
-            WHERE {where_sql}
-            ORDER BY rank
-            LIMIT ? OFFSET ?
-        """
-
-        with self._lock:
+            WHERE {wh}
+            ORDER BY {rank}
+            LIMIT :lim OFFSET :off
+            """
             try:
-                cursor = self._conn.execute(sql, params)
-            except sqlite3.OperationalError:
-                # FTS5 query syntax error despite sanitization — return empty
-                # unless query contains CJK (fall back to LIKE below)
-                if not self._contains_cjk(query):
-                    return []
+                with self._engine.connect() as conn:
+                    rows = conn.execute(text(sql), p).mappings().all()
+                matches = [dict(x) for x in rows]
+            except (ProgrammingError, OperationalError):
                 matches = []
-            else:
-                matches = [dict(row) for row in cursor.fetchall()]
+            if matches:
+                break
 
-        # LIKE fallback for CJK queries: FTS5 default tokenizer splits CJK
-        # characters individually, causing multi-character queries to fail.
-        if not matches and self._contains_cjk(query):
-            raw_query = query.strip('"').strip()
-            like_where = ["m.content LIKE ?"]
-            like_params: list = [f"%{raw_query}%"]
+        cjk = self._contains_cjk(sanitized)
+        if not matches and cjk:
+            raw_q = sanitized.strip('"').strip()
+            w_parts2 = ["m.content LIKE :likeq"]
+            p2: Dict[str, Any] = {
+                "likeq": f"%{raw_q}%",
+                "instr": raw_q,
+                "lim": limit,
+                "off": offset,
+            }
             if source_filter is not None:
-                like_where.append(f"s.source IN ({','.join('?' for _ in source_filter)})")
-                like_params.extend(source_filter)
+                ph = ", ".join(f":sf_{i}" for i in range(len(source_filter)))
+                w_parts2.append(f"s.source IN ({ph})")
+                for i, v in enumerate(source_filter):
+                    p2[f"sf_{i}"] = v
             if exclude_sources is not None:
-                like_where.append(f"s.source NOT IN ({','.join('?' for _ in exclude_sources)})")
-                like_params.extend(exclude_sources)
+                ph = ", ".join(f":xs_{i}" for i in range(len(exclude_sources)))
+                w_parts2.append(f"s.source NOT IN ({ph})")
+                for i, v in enumerate(exclude_sources):
+                    p2[f"xs_{i}"] = v
             if role_filter:
-                like_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
-                like_params.extend(role_filter)
-            like_sql = f"""
-                SELECT m.id, m.session_id, m.role,
-                       substr(m.content,
-                              max(1, instr(m.content, ?) - 40),
-                              120) AS snippet,
-                       m.content, m.timestamp, m.tool_name,
-                       s.source, s.model, s.started_at AS session_started
+                ph = ", ".join(f":rf_{i}" for i in range(len(role_filter)))
+                w_parts2.append(f"m.role IN ({ph})")
+                for i, v in enumerate(role_filter):
+                    p2[f"rf_{i}"] = v
+            wh2 = " AND ".join(w_parts2)
+            sql_like = f"""
+                SELECT m.id, m.session_id, m.role, m.content,
+                    SUBSTRING(m.content,
+                        GREATEST(1, LOCATE(:instr, m.content) - 40), 120) AS snippet,
+                    m.timestamp, m.tool_name, s.source, s.model, s.started_at AS session_started
                 FROM messages m
                 JOIN sessions s ON s.id = m.session_id
-                WHERE {' AND '.join(like_where)}
+                WHERE {wh2}
                 ORDER BY m.timestamp DESC
-                LIMIT ? OFFSET ?
+                LIMIT :lim OFFSET :off
             """
-            like_params.extend([limit, offset])
-            # instr() parameter goes first in the bound list
-            like_params = [raw_query] + like_params
-            with self._lock:
-                like_cursor = self._conn.execute(like_sql, like_params)
-                matches = [dict(row) for row in like_cursor.fetchall()]
+            with self._engine.connect() as conn:
+                matches = [dict(x) for x in conn.execute(text(sql_like), p2).mappings().all()]
 
-        # Add surrounding context (1 message before + after each match).
-        # Done outside the lock so we don't hold it across N sequential queries.
-        for match in matches:
+        if not matches and not cjk and q_nl:
+            likeq = f"%{q_nl}%"
+            w_parts3 = ["m.content IS NOT NULL", "m.content LIKE :likebroad"]
+            p3: Dict[str, Any] = {
+                "likebroad": likeq,
+                "lim": limit,
+                "off": offset,
+            }
+            if source_filter is not None:
+                ph = ", ".join(f":sf_{i}" for i in range(len(source_filter)))
+                w_parts3.append(f"s.source IN ({ph})")
+                for i, v in enumerate(source_filter):
+                    p3[f"sf_{i}"] = v
+            if exclude_sources is not None:
+                ph = ", ".join(f":xs_{i}" for i in range(len(exclude_sources)))
+                w_parts3.append(f"s.source NOT IN ({ph})")
+                for i, v in enumerate(exclude_sources):
+                    p3[f"xs_{i}"] = v
+            if role_filter:
+                ph = ", ".join(f":rf_{i}" for i in range(len(role_filter)))
+                w_parts3.append(f"m.role IN ({ph})")
+                for i, v in enumerate(role_filter):
+                    p3[f"rf_{i}"] = v
+            wh3 = " AND ".join(w_parts3)
+            sql_broad = f"""
+                SELECT m.id, m.session_id, m.role, m.content,
+                    SUBSTRING(m.content, 1, 120) AS snippet,
+                    m.timestamp, m.tool_name, s.source, s.model, s.started_at AS session_started
+                FROM messages m
+                JOIN sessions s ON s.id = m.session_id
+                WHERE {wh3}
+                ORDER BY m.timestamp DESC
+                LIMIT :lim OFFSET :off
+            """
+            with self._engine.connect() as conn:
+                matches = [dict(x) for x in conn.execute(text(sql_broad), p3).mappings().all()]
+
+        for mrow in matches:
+            content = mrow.get("content") or ""
+            if "snippet" not in mrow or mrow["snippet"] is None:
+                n = q_nl or sanitized.replace('"', "")
+                n = n.split()[0] if n.split() else n
+                pos = content.lower().find(n.lower()[:20]) if n else -1
+                if pos >= 0:
+                    start = max(0, pos - 40)
+                    mrow["snippet"] = content[start : start + 120]
+                else:
+                    mrow["snippet"] = content[:120]
             try:
-                with self._lock:
-                    ctx_cursor = self._conn.execute(
-                        """WITH target AS (
+                with self._engine.connect() as conn:
+                    ctx = conn.execute(
+                        text(
+                            """WITH target AS (
                                SELECT session_id, timestamp, id
                                FROM messages
-                               WHERE id = ?
+                               WHERE id = :mid
                            )
                            SELECT role, content
                            FROM (
@@ -1298,11 +1028,11 @@ class SessionDB:
                                   OR (m.timestamp = t.timestamp AND m.id < t.id)
                                ORDER BY m.timestamp DESC, m.id DESC
                                LIMIT 1
-                           )
+                           ) AS prev
                            UNION ALL
                            SELECT role, content
                            FROM messages
-                           WHERE id = ?
+                           WHERE id = :mid2
                            UNION ALL
                            SELECT role, content
                            FROM (
@@ -1313,21 +1043,17 @@ class SessionDB:
                                   OR (m.timestamp = t.timestamp AND m.id > t.id)
                                ORDER BY m.timestamp ASC, m.id ASC
                                LIMIT 1
-                           )""",
-                        (match["id"], match["id"]),
+                           ) AS nxt """
+                        ),
+                        {"mid": mrow["id"], "mid2": mrow["id"]},
                     )
                     context_msgs = [
-                        {"role": r["role"], "content": (r["content"] or "")[:200]}
-                        for r in ctx_cursor.fetchall()
+                        {"role": r["role"], "content": (r["content"] or "")[:200]} for r in ctx.mappings()
                     ]
-                match["context"] = context_msgs
-            except Exception:
-                match["context"] = []
-
-        # Remove full content from result (snippet is enough, saves tokens)
-        for match in matches:
-            match.pop("content", None)
-
+            except (ProgrammingError, OperationalError):
+                context_msgs = []
+            mrow["context"] = context_msgs
+            mrow.pop("content", None)
         return matches
 
     def search_sessions(
@@ -1336,193 +1062,121 @@ class SessionDB:
         limit: int = 20,
         offset: int = 0,
     ) -> List[Dict[str, Any]]:
-        """List sessions, optionally filtered by source."""
-        with self._lock:
-            if source:
-                cursor = self._conn.execute(
-                    "SELECT * FROM sessions WHERE source = ? ORDER BY started_at DESC LIMIT ? OFFSET ?",
-                    (source, limit, offset),
-                )
-            else:
-                cursor = self._conn.execute(
-                    "SELECT * FROM sessions ORDER BY started_at DESC LIMIT ? OFFSET ?",
-                    (limit, offset),
-                )
-            return [dict(row) for row in cursor.fetchall()]
+        stmt = select(self._sessions).order_by(
+            self._sessions.c.started_at.desc()
+        ).limit(limit).offset(offset)
+        if source:
+            stmt = stmt.where(self._sessions.c.source == source)
+        with self._engine.connect() as conn:
+            return [dict(x) for x in conn.execute(stmt).mappings().all()]
 
     # =========================================================================
     # Utility
     # =========================================================================
 
     def session_count(self, source: str = None) -> int:
-        """Count sessions, optionally filtered by source."""
-        with self._lock:
-            if source:
-                cursor = self._conn.execute(
-                    "SELECT COUNT(*) FROM sessions WHERE source = ?", (source,)
-                )
-            else:
-                cursor = self._conn.execute("SELECT COUNT(*) FROM sessions")
-            return cursor.fetchone()[0]
+        stmt = select(func.count()).select_from(self._sessions)
+        if source:
+            stmt = stmt.where(self._sessions.c.source == source)
+        with self._engine.connect() as conn:
+            return int(conn.execute(stmt).scalar_one())
 
     def message_count(self, session_id: str = None) -> int:
-        """Count messages, optionally for a specific session."""
-        with self._lock:
-            if session_id:
-                cursor = self._conn.execute(
-                    "SELECT COUNT(*) FROM messages WHERE session_id = ?", (session_id,)
-                )
-            else:
-                cursor = self._conn.execute("SELECT COUNT(*) FROM messages")
-            return cursor.fetchone()[0]
-
-    # =========================================================================
-    # Export and cleanup
-    # =========================================================================
+        stmt = select(func.count()).select_from(self._messages)
+        if session_id:
+            stmt = stmt.where(self._messages.c.session_id == session_id)
+        with self._engine.connect() as conn:
+            return int(conn.execute(stmt).scalar_one())
 
     def export_session(self, session_id: str) -> Optional[Dict[str, Any]]:
-        """Export a single session with all its messages as a dict."""
         session = self.get_session(session_id)
         if not session:
             return None
-        messages = self.get_messages(session_id)
-        return {**session, "messages": messages}
+        return {**session, "messages": self.get_messages(session_id)}
 
     def export_all(self, source: str = None) -> List[Dict[str, Any]]:
-        """
-        Export all sessions (with messages) as a list of dicts.
-        Suitable for writing to a JSONL file for backup/analysis.
-        """
         sessions = self.search_sessions(source=source, limit=100000)
-        results = []
-        for session in sessions:
-            messages = self.get_messages(session["id"])
-            results.append({**session, "messages": messages})
-        return results
+        return [{**s, "messages": self.get_messages(s["id"])} for s in sessions]
 
     def clear_messages(self, session_id: str) -> None:
-        """Delete all messages for a session and reset its counters."""
-        def _do(conn):
+        with self._engine.begin() as conn:
             conn.execute(
-                "DELETE FROM messages WHERE session_id = ?", (session_id,)
+                delete(self._messages).where(self._messages.c.session_id == session_id)
             )
             conn.execute(
-                "UPDATE sessions SET message_count = 0, tool_call_count = 0 WHERE id = ?",
-                (session_id,),
+                update(self._sessions)
+                .where(self._sessions.c.id == session_id)
+                .values(message_count=0, tool_call_count=0)
             )
-        self._execute_write(_do)
 
     def delete_session(self, session_id: str) -> bool:
-        """Delete a session and all its messages.
-
-        Child sessions are orphaned (parent_session_id set to NULL) rather
-        than cascade-deleted, so they remain accessible independently.
-        Returns True if the session was found and deleted.
-        """
-        def _do(conn):
-            cursor = conn.execute(
-                "SELECT COUNT(*) FROM sessions WHERE id = ?", (session_id,)
-            )
-            if cursor.fetchone()[0] == 0:
+        with self._engine.begin() as conn:
+            exists = conn.execute(
+                select(self._sessions.c.id).where(self._sessions.c.id == session_id)
+            ).first()
+            if not exists:
                 return False
-            # Orphan child sessions so FK constraint is satisfied
             conn.execute(
-                "UPDATE sessions SET parent_session_id = NULL "
-                "WHERE parent_session_id = ?",
-                (session_id,),
+                update(self._sessions)
+                .where(self._sessions.c.parent_session_id == session_id)
+                .values(parent_session_id=None)
             )
-            conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
-            conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
-            return True
-        return self._execute_write(_do)
+            conn.execute(
+                delete(self._messages).where(self._messages.c.session_id == session_id)
+            )
+            conn.execute(delete(self._sessions).where(self._sessions.c.id == session_id))
+        return True
 
     def prune_sessions(self, older_than_days: int = 90, source: str = None) -> int:
-        """Delete sessions older than N days. Returns count of deleted sessions.
-
-        Only prunes ended sessions (not active ones).  Child sessions outside
-        the prune window are orphaned (parent_session_id set to NULL) rather
-        than cascade-deleted.
-        """
         cutoff = time.time() - (older_than_days * 86400)
-
-        def _do(conn):
-            if source:
-                cursor = conn.execute(
-                    """SELECT id FROM sessions
-                       WHERE started_at < ? AND ended_at IS NOT NULL AND source = ?""",
-                    (cutoff, source),
+        with self._engine.begin() as conn:
+            stmt = select(self._sessions.c.id).where(
+                and_(
+                    self._sessions.c.started_at < cutoff,
+                    self._sessions.c.ended_at.isnot(None),
                 )
-            else:
-                cursor = conn.execute(
-                    "SELECT id FROM sessions WHERE started_at < ? AND ended_at IS NOT NULL",
-                    (cutoff,),
-                )
-            session_ids = set(row["id"] for row in cursor.fetchall())
-
-            if not session_ids:
-                return 0
-
-            # Orphan any sessions whose parent is about to be deleted
-            placeholders = ",".join("?" * len(session_ids))
-            conn.execute(
-                f"UPDATE sessions SET parent_session_id = NULL "
-                f"WHERE parent_session_id IN ({placeholders})",
-                list(session_ids),
             )
-
-            for sid in session_ids:
-                conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
-                conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
-            return len(session_ids)
-
-        return self._execute_write(_do)
-
-    # ── Meta key/value (for scheduler bookkeeping) ──
+            if source:
+                stmt = stmt.where(self._sessions.c.source == source)
+            ids = [r[0] for r in conn.execute(stmt).all()]
+            if not ids:
+                return 0
+            conn.execute(
+                update(self._sessions)
+                .where(self._sessions.c.parent_session_id.in_(ids))
+                .values(parent_session_id=None)
+            )
+            conn.execute(
+                delete(self._messages).where(self._messages.c.session_id.in_(ids))
+            )
+            conn.execute(
+                delete(self._sessions).where(self._sessions.c.id.in_(ids))
+            )
+            return len(ids)
 
     def get_meta(self, key: str) -> Optional[str]:
-        """Read a value from the state_meta key/value store."""
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT value FROM state_meta WHERE key = ?", (key,)
-            ).fetchone()
-        if row is None:
-            return None
-        return row["value"] if isinstance(row, sqlite3.Row) else row[0]
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                select(self._state_meta.c.value).where(self._state_meta.c.key == key)
+            ).first()
+        return row[0] if row else None
 
     def set_meta(self, key: str, value: str) -> None:
-        """Write a value to the state_meta key/value store."""
-        def _do(conn):
-            conn.execute(
-                "INSERT INTO state_meta (key, value) VALUES (?, ?) "
-                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                (key, value),
-            )
-        self._execute_write(_do)
-
-    # ── Space reclamation ──
+        with self._engine.begin() as conn:
+            exists = conn.execute(
+                select(self._state_meta.c.key).where(self._state_meta.c.key == key)
+            ).first()
+            if exists:
+                conn.execute(
+                    update(self._state_meta)
+                    .where(self._state_meta.c.key == key)
+                    .values(value=value)
+                )
+            else:
+                conn.execute(insert(self._state_meta).values(key=key, value=value))
 
     def vacuum(self) -> None:
-        """Run VACUUM to reclaim disk space after large deletes.
-
-        SQLite does not shrink the database file when rows are deleted —
-        freed pages just get reused on the next insert. After a prune that
-        removed hundreds of sessions, the file stays bloated unless we
-        explicitly VACUUM.
-
-        VACUUM rewrites the entire DB, so it's expensive (seconds per
-        100MB) and cannot run inside a transaction. It also acquires an
-        exclusive lock, so callers must ensure no other writers are
-        active. Safe to call at startup before the gateway/CLI starts
-        serving traffic.
-        """
-        # VACUUM cannot be executed inside a transaction.
-        with self._lock:
-            # Best-effort WAL checkpoint first, then VACUUM.
-            try:
-                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            except Exception:
-                pass
-            self._conn.execute("VACUUM")
+        return None
 
     def maybe_auto_prune_and_vacuum(
         self,
@@ -1530,24 +1184,8 @@ class SessionDB:
         min_interval_hours: int = 24,
         vacuum: bool = True,
     ) -> Dict[str, Any]:
-        """Idempotent auto-maintenance: prune old sessions + optional VACUUM.
-
-        Records the last run timestamp in state_meta so subsequent calls
-        within ``min_interval_hours`` no-op. Designed to be called once at
-        startup from long-lived entrypoints (CLI, gateway, cron scheduler).
-
-        Never raises. On any failure, logs a warning and returns a dict
-        with ``"error"`` set.
-
-        Returns a dict with keys:
-          - ``"skipped"`` (bool) — true if within min_interval_hours of last run
-          - ``"pruned"`` (int)   — number of sessions deleted
-          - ``"vacuumed"`` (bool) — true if VACUUM ran
-          - ``"error"`` (str, optional) — present only on failure
-        """
         result: Dict[str, Any] = {"skipped": False, "pruned": 0, "vacuumed": False}
         try:
-            # Skip if another process/call did maintenance recently.
             last_raw = self.get_meta("last_auto_prune")
             now = time.time()
             if last_raw:
@@ -1557,35 +1195,20 @@ class SessionDB:
                         result["skipped"] = True
                         return result
                 except (TypeError, ValueError):
-                    pass  # corrupt meta; treat as no prior run
-
+                    pass
             pruned = self.prune_sessions(older_than_days=retention_days)
             result["pruned"] = pruned
-
-            # Only VACUUM if we actually freed rows — VACUUM on a tight DB
-            # is wasted I/O. Threshold keeps small DBs from paying the cost.
             if vacuum and pruned > 0:
-                try:
-                    self.vacuum()
-                    result["vacuumed"] = True
-                except Exception as exc:
-                    logger.warning("state.db VACUUM failed: %s", exc)
-
-            # Record the attempt even if pruned == 0, so we don't retry
-            # every startup within the min_interval_hours window.
+                self.vacuum()
+                result["vacuumed"] = True
             self.set_meta("last_auto_prune", str(now))
-
             if pruned > 0:
                 logger.info(
-                    "state.db auto-maintenance: pruned %d session(s) older than %d days%s",
+                    "MySQL state auto-maintenance: pruned %d session(s) older than %d days",
                     pruned,
                     retention_days,
-                    " + VACUUM" if result["vacuumed"] else "",
                 )
         except Exception as exc:
-            # Maintenance must never block startup. Log and return error marker.
-            logger.warning("state.db auto-maintenance failed: %s", exc)
+            logger.warning("MySQL state auto-maintenance failed: %s", exc)
             result["error"] = str(exc)
-
         return result
-

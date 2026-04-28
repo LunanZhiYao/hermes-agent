@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
+import pytest
 import yaml
 
 from hermes_cli.config import (
@@ -20,6 +21,7 @@ from hermes_cli.config import (
     save_env_value_secure,
     sanitize_env_file,
     _sanitize_env_lines,
+    get_database_env_config,
 )
 
 
@@ -70,6 +72,50 @@ class TestLoadConfigDefaults:
             assert "terminal" in config
             assert config["terminal"]["backend"] == "local"
             assert config["display"]["interim_assistant_messages"] is True
+
+
+class TestDatabaseEnvConfig:
+    def test_missing_required_env_raises(self, monkeypatch):
+        for key in ("DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD"):
+            monkeypatch.delenv(key, raising=False)
+        with pytest.raises(RuntimeError, match="Missing required DB env vars"):
+            get_database_env_config()
+
+    def test_invalid_port_raises(self, monkeypatch):
+        monkeypatch.setenv("DB_HOST", "127.0.0.1")
+        monkeypatch.setenv("DB_PORT", "not-a-number")
+        monkeypatch.setenv("DB_NAME", "hermes")
+        monkeypatch.setenv("DB_USER", "hermes")
+        monkeypatch.setenv("DB_PASSWORD", "secret")
+        with pytest.raises(RuntimeError, match="Invalid DB_PORT value"):
+            get_database_env_config()
+
+    def test_reads_required_env_successfully(self, monkeypatch):
+        monkeypatch.setenv("DB_HOST", "127.0.0.1")
+        monkeypatch.setenv("DB_PORT", "3306")
+        monkeypatch.setenv("DB_NAME", "hermes")
+        monkeypatch.setenv("DB_USER", "hermes")
+        monkeypatch.setenv("DB_PASSWORD", "secret")
+        monkeypatch.setenv("DB_CHARSET", "utf8mb4")
+        cfg = get_database_env_config()
+        assert cfg["host"] == "127.0.0.1"
+        assert cfg["port"] == 3306
+        assert cfg["name"] == "hermes"
+        assert cfg["user"] == "hermes"
+        assert cfg["password"] == "secret"
+        assert cfg["charset"] == "utf8mb4"
+
+    def test_shared_engine_uses_mysql_driver(self, monkeypatch):
+        monkeypatch.setenv("DB_HOST", "127.0.0.1")
+        monkeypatch.setenv("DB_PORT", "3306")
+        monkeypatch.setenv("DB_NAME", "hermes")
+        monkeypatch.setenv("DB_USER", "hermes")
+        monkeypatch.setenv("DB_PASSWORD", "secret")
+        monkeypatch.setenv("DB_CHARSET", "utf8mb4")
+        from hermes_cli import db_engine
+        db_engine._ENGINE = None
+        engine = db_engine.get_engine()
+        assert engine.url.drivername == "mysql+pymysql"
 
     def test_legacy_root_level_max_turns_migrates_to_agent_config(self, tmp_path):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):

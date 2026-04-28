@@ -14,6 +14,7 @@ Tests cover:
 
 import asyncio
 import json
+import os
 import time
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -21,6 +22,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import AioHTTPTestCase, TestClient, TestServer
+from sqlalchemy import create_engine, text
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.api_server import (
@@ -33,6 +35,34 @@ from gateway.platforms.api_server import (
     cors_middleware,
     security_headers_middleware,
 )
+
+
+@pytest.fixture(scope="module")
+def _api_server_shared_engine():
+    required = ("DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD")
+    if not all(os.environ.get(k) for k in required):
+        pytest.skip("requires DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD")
+
+    from hermes_cli import db_engine as _de
+    from hermes_state import SessionDB
+
+    engine = _de.get_engine()
+    SessionDB(engine=engine).close()
+    ResponseStore(max_size=1).close()
+    return engine
+
+
+@pytest.fixture(autouse=True)
+def _mock_api_server_db_engine(monkeypatch, _api_server_shared_engine):
+    engine = _api_server_shared_engine
+    with engine.begin() as conn:
+        conn.execute(text("SET FOREIGN_KEY_CHECKS=0"))
+        for t in ("responses", "conversations", "messages", "sessions", "state_meta", "schema_version"):
+            conn.execute(text(f"TRUNCATE TABLE {t}"))
+        conn.execute(text("SET FOREIGN_KEY_CHECKS=1"))
+        conn.execute(text("INSERT INTO schema_version (version) VALUES (8)"))
+    monkeypatch.setattr("gateway.platforms.api_server.get_engine", lambda: engine, raising=False)
+    yield
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +85,17 @@ class TestCheckRequirements:
 
 
 class TestResponseStore:
+    def test_uses_shared_engine_factory(self):
+        with patch("gateway.platforms.api_server.get_engine") as mock_get_engine:
+            required = ("DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD")
+            if not all(os.environ.get(k) for k in required):
+                pytest.skip("requires DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD")
+            from hermes_cli import db_engine as _de
+            engine = _de.get_engine()
+            mock_get_engine.return_value = engine
+            ResponseStore(max_size=10)
+            mock_get_engine.assert_called_once()
+
     def test_put_and_get(self):
         store = ResponseStore(max_size=10)
         store.put("resp_1", {"output": "hello"})
@@ -104,6 +145,43 @@ class TestResponseStore:
     def test_delete_missing(self):
         store = ResponseStore(max_size=10)
         assert store.delete("resp_missing") is False
+
+    def test_close_does_not_dispose_shared_engine(self):
+        """close() must not break subsequent stores using the same shared engine."""
+        s1 = ResponseStore(max_size=10)
+        s1.put("r1", {"a": 1})
+        s1.close()
+        s2 = ResponseStore(max_size=10)
+        assert s1.get("r1") == {"a": 1}
+        s2.put("r2", {"b": 2})
+        assert s2.get("r2") == {"b": 2}
+        s2.close()
+
+    def test_set_conversation_get_conversation(self):
+        store = ResponseStore(max_size=10)
+        assert store.get_conversation("c1") is None
+        store.set_conversation("c1", "resp_abc")
+        assert store.get_conversation("c1") == "resp_abc"
+        store.set_conversation("c1", "resp_def")
+        assert store.get_conversation("c1") == "resp_def"
+
+    def test_lru_eviction_removes_stale_conversation_mapping(self):
+        """Evicted response_ids must not leave conversation rows pointing at them."""
+        store = ResponseStore(max_size=2)
+        store.put("resp_a", {"x": 1})
+        store.put("resp_b", {"x": 2})
+        store.set_conversation("my-conv", "resp_a")
+        assert store.get_conversation("my-conv") == "resp_a"
+        store.put("resp_c", {"x": 3})
+        assert store.get("resp_a") is None
+        assert store.get_conversation("my-conv") is None
+
+    def test_delete_removes_conversation_mapping_for_that_response(self):
+        store = ResponseStore(max_size=10)
+        store.put("resp_x", {"out": "ok"})
+        store.set_conversation("named", "resp_x")
+        assert store.delete("resp_x") is True
+        assert store.get_conversation("named") is None
 
 
 # ---------------------------------------------------------------------------

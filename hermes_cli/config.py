@@ -27,6 +27,37 @@ from typing import Dict, Any, Optional, List, Tuple
 
 logger = logging.getLogger(__name__)
 
+
+def get_database_env_config() -> Dict[str, Any]:
+    """Strict env-only MySQL connection settings (all keys required for runtime).
+
+    Collation is fixed at the server/database (utf8mb4_0900_ai_ci) — not passed here.
+    """
+    required = {
+        "host": "DB_HOST",
+        "port": "DB_PORT",
+        "name": "DB_NAME",
+        "user": "DB_USER",
+        "password": "DB_PASSWORD",
+    }
+    out: Dict[str, Any] = {}
+    missing: List[str] = []
+    for key, env_name in required.items():
+        raw = (os.environ.get(env_name) or "").strip()
+        if not raw:
+            missing.append(env_name)
+        out[key] = raw
+    if missing:
+        raise ValueError(
+            "Missing required MySQL environment variable(s): " + ", ".join(sorted(missing))
+        )
+    out["port"] = int(out["port"])
+    out["charset"] = (os.environ.get("DB_CHARSET") or "utf8mb4").strip()
+    if not out["charset"]:
+        out["charset"] = "utf8mb4"
+    return out
+
+
 _IS_WINDOWS = platform.system() == "Windows"
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _LAST_EXPANDED_CONFIG_BY_PATH: Dict[str, Any] = {}
@@ -960,11 +991,10 @@ DEFAULT_CONFIG = {
         "force_ipv4": False,
     },
 
-    # Session storage — controls automatic cleanup of ~/.hermes/state.db.
-    # state.db accumulates every session, message, tool call, and FTS5 index
-    # entry forever.  Without auto-pruning, a heavy user (gateway + cron)
-    # reports 384MB+ databases with 68K+ messages, which slows down FTS5
-    # inserts, /resume listing, and insights queries.
+    # Session storage — controls automatic cleanup for SessionDB (MySQL).
+    # SessionDB accumulates every session/message/tool-call row unless pruned.
+    # Without auto-pruning, long-lived gateway+cron deployments can grow large
+    # enough to slow resume/list/search and increase storage/backup cost.
     "sessions": {
         # When true, prune ended sessions older than retention_days once
         # per (roughly) min_interval_hours at CLI/gateway/cron startup.
@@ -975,16 +1005,13 @@ DEFAULT_CONFIG = {
         # How many days of ended-session history to keep.  Matches the
         # default of ``hermes sessions prune``.
         "retention_days": 90,
-        # VACUUM after a prune that actually deleted rows.  SQLite does not
-        # reclaim disk space on DELETE — freed pages are just reused on
-        # subsequent INSERTs — so without VACUUM the file stays bloated
-        # even after pruning.  VACUUM blocks writes for a few seconds per
-        # 100MB, so it only runs at startup, and only when prune deleted
-        # ≥1 session.
+        # Keep config compatibility with historical clients. In the MySQL-only
+        # backend this flag maps to post-prune maintenance hooks and currently
+        # does not trigger file-level compaction.
         "vacuum_after_prune": True,
         # Minimum hours between auto-maintenance runs (avoids repeating
-        # the sweep on every CLI invocation).  Tracked via state_meta in
-        # state.db itself, so it's shared across all processes.
+        # the sweep on every CLI invocation). Tracked via state_meta so the
+        # marker is shared across CLI/gateway/cron processes.
         "min_interval_hours": 24,
     },
 
