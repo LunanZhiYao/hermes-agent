@@ -709,9 +709,9 @@ class GatewayRunner:
             from hermes_state import SessionDB
             self._session_db = SessionDB()
         except Exception as e:
-            logger.debug("SQLite session store not available: %s", e)
+            logger.debug("SessionDB not available: %s", e)
 
-        # Opportunistic state.db maintenance: prune ended sessions older
+        # Opportunistic SessionDB maintenance: prune ended sessions older
         # than sessions.retention_days + optional VACUUM. Tracks last-run
         # in state_meta so it only actually executes once per
         # sessions.min_interval_hours.  Gateway is long-lived so blocking
@@ -728,7 +728,7 @@ class GatewayRunner:
                         vacuum=bool(_sess_cfg.get("vacuum_after_prune", True)),
                     )
             except Exception as exc:
-                logger.debug("state.db auto-maintenance skipped: %s", exc)
+                logger.debug("SessionDB auto-maintenance skipped: %s", exc)
 
         # DM pairing store for code-based user authorization
         from gateway.pairing import PairingStore
@@ -2710,11 +2710,7 @@ class GatewayRunner:
             # disconnect (defense in depth; safe to call repeatedly).
             _kill_tool_subprocesses("final-cleanup")
 
-            # Close SQLite session DBs so the WAL write lock is released.
-            # Without this, --replace and similar restart flows leave the
-            # old gateway's connection holding the WAL lock until Python
-            # actually exits — causing 'database is locked' errors when
-            # the new gateway tries to open the same file.
+            # Close SessionDB handles to release pooled connections promptly.
             for _db_holder in (self, getattr(self, "session_store", None)):
                 _db = getattr(_db_holder, "_db", None) if _db_holder else None
                 if _db is None or not hasattr(_db, "close"):
@@ -4766,7 +4762,7 @@ class GatewayRunner:
                             {"role": "assistant", "content": response, "timestamp": ts}
                         )
                 else:
-                    # The agent already persisted these messages to SQLite via
+                    # The agent already persisted these messages to SessionDB via
                     # _flush_messages_to_session_db(), so skip the DB write here
                     # to prevent the duplicate-write bug (#860).  We still write
                     # to JSONL for backward compatibility and as a backup.
@@ -7115,7 +7111,7 @@ class GatewayRunner:
                 )
 
                 # _compress_context already calls end_session() on the old session
-                # (preserving its full transcript in SQLite) and creates a new
+                # (preserving its full transcript in SessionDB) and creates a new
                 # session_id for the continuation.  Write the compressed messages
                 # into the NEW session so the original history stays searchable.
                 new_session_id = tmp_agent.session_id
@@ -7157,7 +7153,7 @@ class GatewayRunner:
         if not self._session_db:
             return "Session database not available."
 
-        # Ensure session exists in SQLite DB (it may only exist in session_store
+        # Ensure session exists in SessionDB (it may only exist in session_store
         # if this is the first command in a new session)
         existing_title = self._session_db.get_session_title(session_id)
         if existing_title is None:

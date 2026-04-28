@@ -551,8 +551,8 @@ class SessionStore:
     """
     Manages session storage and retrieval.
     
-    Uses SQLite (via SessionDB) for session metadata and message transcripts.
-    Falls back to legacy JSONL files if SQLite is unavailable.
+    Uses SessionDB for session metadata and message transcripts.
+    Falls back to legacy JSONL files if SessionDB is unavailable.
     """
     
     def __init__(self, sessions_dir: Path, config: GatewayConfig,
@@ -564,13 +564,13 @@ class SessionStore:
         self._lock = threading.Lock()
         self._has_active_processes_fn = has_active_processes_fn
         
-        # Initialize SQLite session database
+        # Initialize SessionDB backing store
         self._db = None
         try:
             from hermes_state import SessionDB
             self._db = SessionDB()
         except Exception as e:
-            print(f"[gateway] Warning: SQLite session store unavailable, falling back to JSONL: {e}")
+            print(f"[gateway] Warning: SessionDB unavailable, falling back to JSONL: {e}")
     
     def _ensure_loaded(self) -> None:
         """Load sessions index from disk if not already loaded."""
@@ -716,7 +716,7 @@ class SessionStore:
     def has_any_sessions(self) -> bool:
         """Check if any sessions have ever been created (across all platforms).
 
-        Uses the SQLite database as the source of truth because it preserves
+        Uses SessionDB as the source of truth because it preserves
         historical session records (ended sessions still count).  The in-memory
         ``_entries`` dict replaces entries on reset, so ``len(_entries)`` would
         stay at 1 for single-platform users — which is the bug this fixes.
@@ -744,12 +744,12 @@ class SessionStore:
         Get an existing session or create a new one.
 
         Evaluates reset policy to determine if the existing session is stale.
-        Creates a session record in SQLite when a new session starts.
+        Creates a session record in SessionDB when a new session starts.
         """
         session_key = self._generate_session_key(source)
         now = _now()
 
-        # SQLite calls are made outside the lock to avoid holding it during I/O.
+        # SessionDB calls are made outside the lock to avoid holding it during I/O.
         # All _entries / _loaded mutations are protected by self._lock.
         db_end_session_id = None
         db_create_kwargs = None
@@ -821,7 +821,7 @@ class SessionStore:
                 "user_id": source.user_id,
             }
 
-        # SQLite operations outside the lock
+        # SessionDB operations outside the lock
         if self._db and db_end_session_id:
             try:
                 self._db.end_session(db_end_session_id, "session_reset")
@@ -832,7 +832,7 @@ class SessionStore:
             try:
                 self._db.create_session(**db_create_kwargs)
             except Exception as e:
-                print(f"[gateway] Warning: Failed to create SQLite session: {e}")
+                print(f"[gateway] Warning: Failed to create SessionDB session: {e}")
 
         return entry
 
@@ -927,7 +927,7 @@ class SessionStore:
         background work isn't orphaned.
 
         Pruning is functionally identical to a natural reset-policy expiry:
-        the transcript in SQLite stays, but the session_key → session_id
+        the transcript in SessionDB stays, but the session_key → session_id
         mapping is dropped and the user starts a fresh session on return.
 
         ``max_age_days <= 0`` disables pruning; returns 0 immediately.
@@ -1059,7 +1059,7 @@ class SessionStore:
         """Switch a session key to point at an existing session ID.
 
         Used by ``/resume`` to restore a previously-named session.
-        Ends the current session in SQLite (like reset), but instead of
+        Ends the current session in SessionDB (like reset), but instead of
         generating a fresh session ID, re-uses ``target_session_id`` so the
         old transcript is loaded on the next message. If the target session was
         previously ended, re-open it so gateway resume semantics match the CLI.
@@ -1129,15 +1129,15 @@ class SessionStore:
         return self.sessions_dir / f"{session_id}.jsonl"
     
     def append_to_transcript(self, session_id: str, message: Dict[str, Any], skip_db: bool = False) -> None:
-        """Append a message to a session's transcript (SQLite + legacy JSONL).
+        """Append a message to a session's transcript (SessionDB + legacy JSONL).
 
         Args:
-            skip_db: When True, only write to JSONL and skip the SQLite write.
-                     Used when the agent already persisted messages to SQLite
+            skip_db: When True, only write to JSONL and skip the SessionDB write.
+                     Used when the agent already persisted messages to SessionDB
                      via its own _flush_messages_to_session_db(), preventing
                      the duplicate-write bug (#860).
         """
-        # Write to SQLite (unless the agent already handled it)
+        # Write to SessionDB (unless the agent already handled it)
         if self._db and not skip_db:
             try:
                 self._db.append_message(
@@ -1164,9 +1164,9 @@ class SessionStore:
         """Replace the entire transcript for a session with new messages.
         
         Used by /retry, /undo, and /compress to persist modified conversation history.
-        Rewrites both SQLite and legacy JSONL storage.
+        Rewrites both SessionDB and legacy JSONL storage.
         """
-        # SQLite: clear old messages and re-insert
+        # SessionDB: clear old messages and re-insert
         if self._db:
             try:
                 self._db.clear_messages(session_id)
@@ -1196,14 +1196,14 @@ class SessionStore:
     def load_transcript(self, session_id: str) -> List[Dict[str, Any]]:
         """Load all messages from a session's transcript."""
         db_messages = []
-        # Try SQLite first
+        # Try SessionDB first
         if self._db:
             try:
                 db_messages = self._db.get_messages_as_conversation(session_id)
             except Exception as e:
                 logger.debug("Could not load messages from DB: %s", e)
 
-        # Load legacy JSONL transcript (may contain more history than SQLite
+        # Load legacy JSONL transcript (may contain more history than SessionDB
         # for sessions created before the DB layer was introduced).
         transcript_path = self.get_transcript_path(session_id)
         jsonl_messages = []
@@ -1222,18 +1222,18 @@ class SessionStore:
 
         # Prefer whichever source has more messages.
         #
-        # Background: when a session pre-dates SQLite storage (or when the DB
+        # Background: when a session pre-dates SessionDB storage (or when the DB
         # layer was added while a long-lived session was already active), the
-        # first post-migration turn writes only the *new* messages to SQLite
+        # first post-migration turn writes only the *new* messages to SessionDB
         # (because _flush_messages_to_session_db skips messages already in
         # conversation_history, assuming they're persisted).  On the *next*
-        # turn load_transcript returns those few SQLite rows and ignores the
+        # turn load_transcript returns those few SessionDB rows and ignores the
         # full JSONL history — the model sees a context of 1-4 messages instead
         # of hundreds.  Using the longer source prevents this silent truncation.
         if len(jsonl_messages) > len(db_messages):
             if db_messages:
                 logger.debug(
-                    "Session %s: JSONL has %d messages vs SQLite %d — "
+                    "Session %s: JSONL has %d messages vs SessionDB %d — "
                     "using JSONL (legacy session not yet fully migrated)",
                     session_id, len(jsonl_messages), len(db_messages),
                 )
