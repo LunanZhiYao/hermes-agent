@@ -91,6 +91,25 @@ class TestCatchAllPatterns:
         env_content = _read_env(_isolated_hermes_home)
         assert "TERMINAL_SSH_PORT=2222" in env_content
 
+    @pytest.mark.parametrize("key,value", [
+        ("DB_HOST", "127.0.0.1"),
+        ("DB_PORT", "3306"),
+        ("DB_NAME", "hermes"),
+        ("DB_USER", "hermes"),
+        ("DB_PASSWORD", "secret"),
+        ("DB_CHARSET", "utf8mb4"),
+    ])
+    def test_known_db_env_keys_route_to_env(self, key, value, _isolated_hermes_home):
+        set_config_value(key, value)
+        env_content = _read_env(_isolated_hermes_home)
+        assert f"{key}={value}" in env_content
+        assert key not in _read_config(_isolated_hermes_home)
+
+    def test_unknown_db_prefixed_key_does_not_auto_route_to_env(self, _isolated_hermes_home):
+        set_config_value("DB_FUTURE_UNKNOWN", "x")
+        assert "DB_FUTURE_UNKNOWN=x" not in _read_env(_isolated_hermes_home)
+        assert "DB_FUTURE_UNKNOWN: x" in _read_config(_isolated_hermes_home)
+
 
 # ---------------------------------------------------------------------------
 # Non-secret keys → config.yaml
