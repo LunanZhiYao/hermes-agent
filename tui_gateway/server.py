@@ -660,7 +660,7 @@ def _load_cfg() -> dict:
             if _cfg_cache is not None and _cfg_mtime == mtime and _cfg_path == p:
                 return copy.deepcopy(_cfg_cache)
         if p.exists():
-            with open(p) as f:
+            with open(p, encoding="utf-8") as f:
                 data = yaml.safe_load(f) or {}
         else:
             data = {}
@@ -679,7 +679,7 @@ def _save_cfg(cfg: dict):
     import yaml
 
     path = _hermes_home / "config.yaml"
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         yaml.safe_dump(cfg, f)
     with _cfg_lock:
         _cfg_cache = copy.deepcopy(cfg)
@@ -1280,6 +1280,7 @@ def _get_usage(agent) -> dict:
         "output": g("session_output_tokens", "session_completion_tokens"),
         "cache_read": g("session_cache_read_tokens"),
         "cache_write": g("session_cache_write_tokens"),
+        "reasoning": g("session_reasoning_tokens"),
         "prompt": g("session_prompt_tokens"),
         "completion": g("session_completion_tokens"),
         "total": g("session_total_tokens"),
@@ -1414,6 +1415,10 @@ def _session_info(agent) -> dict:
     except Exception:
         info["mcp_servers"] = []
     try:
+        info["system_prompt"] = getattr(agent, "_cached_system_prompt", "") or ""
+    except Exception:
+        pass
+    try:
         from hermes_cli.banner import get_update_result
         from hermes_cli.config import recommended_update_command
 
@@ -1472,6 +1477,11 @@ def _tool_summary(name: str, result: str, duration_s: float | None) -> str | Non
         n = _count_list(data, "results") or _count_list(data, "data", "results")
         if n is not None:
             text = f"Extracted {n} {'page' if n == 1 else 'pages'}"
+
+    if isinstance(data, dict) and data.get("fallback_warning"):
+        warning = str(data.get("fallback_warning") or "").strip()
+        if warning:
+            return f"{warning}{suffix}"
 
     return f"{text}{suffix}" if text else None
 
@@ -1716,21 +1726,46 @@ def _validate_personality(value: str, cfg: dict | None = None) -> tuple[str, str
 def _apply_personality_to_session(
     sid: str, session: dict, new_prompt: str
 ) -> tuple[bool, dict | None]:
+    """Apply a personality change to an existing session without resetting history.
+
+    Updates the agent's ephemeral system prompt in-place so the new personality
+    takes effect on the next turn.  The cached base system prompt is left intact
+    (ephemeral_system_prompt is appended at API-call time, not baked into the
+    cache), which preserves prompt-cache hits.
+
+    Also injects a system-role marker into the conversation history so the model
+    knows to pivot its style from this point forward (without this, LLMs tend to
+    continue the tone established by earlier messages in the transcript).
+
+    Returns (history_reset, info) — history_reset is always False since we
+    preserve the conversation.
+    """
     if not session:
         return False, None
 
-    try:
-        info = _reset_session_agent(sid, session)
-        return True, info
-    except Exception:
-        if session.get("agent"):
-            agent = session["agent"]
-            agent.ephemeral_system_prompt = new_prompt or None
-            agent._cached_system_prompt = None
-            info = _session_info(agent)
-            _emit("session.info", sid, info)
-            return False, info
-        return False, None
+    agent = session.get("agent")
+    if agent:
+        agent.ephemeral_system_prompt = new_prompt or None
+        # Inject a pivot marker into history so the model sees the change point.
+        # This prevents it from pattern-matching its prior style.
+        if new_prompt:
+            marker = (
+                "[System: The user has changed the assistant's personality. "
+                "From this point forward, adopt the following persona and respond "
+                f"accordingly: {new_prompt}]"
+            )
+        else:
+            marker = (
+                "[System: The user has cleared the personality overlay. "
+                "From this point forward, respond in your normal default style.]"
+            )
+        with session["history_lock"]:
+            session["history"].append({"role": "user", "content": marker})
+            session["history_version"] = int(session.get("history_version", 0)) + 1
+        info = _session_info(agent)
+        _emit("session.info", sid, info)
+        return False, info
+    return False, None
 
 
 def _cfg_max_turns(cfg: dict, default: int) -> int:
@@ -1979,6 +2014,36 @@ def _enrich_with_attached_images(user_text: str, image_paths: list[str]) -> str:
     return text or "What do you see in this image?"
 
 
+def _content_display_text(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, (int, float)):
+        return str(content)
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            text = _content_display_text(part).strip()
+            if text:
+                parts.append(text)
+        return "\n".join(parts)
+    if isinstance(content, dict):
+        kind = content.get("type")
+        if kind in {"text", "input_text", "output_text"}:
+            return str(content.get("text") or content.get("content") or "")
+        if kind in {"image_url", "input_image", "image"}:
+            return "[image]"
+        if kind in {"input_audio", "audio"}:
+            return "[audio]"
+        if kind:
+            return f"[{kind}]"
+        if "text" in content:
+            return str(content.get("text") or "")
+        return "[structured content]"
+    return str(content)
+
+
 def _history_to_messages(history: list[dict]) -> list[dict]:
     messages = []
     tool_call_args = {}
@@ -1989,6 +2054,7 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         role = m.get("role")
         if role not in ("user", "assistant", "tool", "system"):
             continue
+        content_text = _content_display_text(m.get("content"))
         if role == "assistant" and m.get("tool_calls"):
             for tc in m["tool_calls"]:
                 fn = tc.get("function", {})
@@ -1999,7 +2065,7 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
                     except (json.JSONDecodeError, TypeError):
                         args = {}
                     tool_call_args[tc_id] = (fn["name"], args)
-            if not (m.get("content") or "").strip():
+            if not content_text.strip():
                 continue
         if role == "tool":
             tc_id = m.get("tool_call_id", "")
@@ -2010,9 +2076,9 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
                 {"role": "tool", "name": name, "context": _tool_ctx(name, args)}
             )
             continue
-        if not (m.get("content") or "").strip():
+        if not content_text.strip():
             continue
-        messages.append({"role": role, "text": m.get("content") or ""})
+        messages.append({"role": role, "text": content_text})
 
     return messages
 
@@ -2547,7 +2613,7 @@ def _(rid, params: dict) -> dict:
         f"hermes_conversation_{_time.strftime('%Y%m%d_%H%M%S')}.json"
     )
     try:
-        with open(filename, "w") as f:
+        with open(filename, "w", encoding="utf-8") as f:
             json.dump(
                 {
                     "model": getattr(session["agent"], "model", ""),
@@ -3128,6 +3194,18 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     if result.get("interrupted")
                     else "error" if result.get("error") else "complete"
                 )
+                # When the backend produced no visible response AND reported a
+                # real error (e.g. invalid model slug → provider 4xx), surface
+                # that error as the visible text instead of shipping an empty
+                # turn to Ink. Mirrors classic CLI behavior at cli.py where
+                # (failed|partial) + no final_response → "Error: <detail>".
+                # Leaves the None-with-no-error path untouched: an empty
+                # successful turn still renders as empty, and the existing
+                # "(empty)" sentinel handling stays in its own lane.
+                if (not raw) and result.get("error") and (
+                    result.get("failed") or result.get("partial")
+                ):
+                    raw = f"Error: {result.get('error')}"
                 lr = result.get("last_reasoning")
                 if isinstance(lr, str) and lr.strip():
                     last_reasoning = lr.strip()
@@ -5610,14 +5688,13 @@ def _(rid, params: dict) -> dict:
 
 @method("voice.record")
 def _(rid, params: dict) -> dict:
-    """VAD-driven continuous record loop, CLI-parity.
+    """VAD-bounded push-to-talk capture, CLI-parity.
 
-    ``start`` turns on a VAD loop that emits ``voice.transcript`` events
-    for each detected utterance and auto-restarts for the next turn.
-    ``stop`` halts the loop (manual stop; matches cli.py's Ctrl+B-while-
-    recording branch clearing ``_voice_continuous``). Three consecutive
-    silent cycles stop the loop automatically and emit a
-    ``voice.transcript`` with ``no_speech_limit=True``.
+    ``start`` begins one VAD-bounded capture and emits ``voice.transcript``
+    after silence stops the recorder. ``stop`` forces transcription of the
+    active buffer, matching classic CLI push-to-talk. The voice wrapper retains
+    no-speech counts across single-shot starts, so three consecutive silent
+    captures emit ``voice.transcript`` with ``no_speech_limit=True``.
     """
     action = params.get("action", "start")
 
@@ -5656,7 +5733,7 @@ def _(rid, params: dict) -> dict:
                 if isinstance(duration, (int, float)) and not isinstance(duration, bool)
                 else 3.0
             )
-            start_continuous(
+            started = start_continuous(
                 on_transcript=lambda t: _voice_emit("voice.transcript", {"text": t}),
                 on_status=lambda s: _voice_emit("voice.status", {"state": s}),
                 on_silent_limit=lambda: _voice_emit(
@@ -5664,13 +5741,19 @@ def _(rid, params: dict) -> dict:
                 ),
                 silence_threshold=safe_threshold,
                 silence_duration=safe_duration,
+                auto_restart=False,
             )
+            if started is False:
+                return _ok(rid, {"status": "busy"})
             return _ok(rid, {"status": "recording"})
 
         # action == "stop"
+        with _voice_sid_lock:
+            _voice_event_sid = params.get("session_id") or _voice_event_sid
+
         from hermes_cli.voice import stop_continuous
 
-        stop_continuous()
+        stop_continuous(force_transcribe=True)
         return _ok(rid, {"status": "stopped"})
     except ImportError:
         return _err(

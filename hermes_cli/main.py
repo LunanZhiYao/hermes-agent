@@ -43,6 +43,24 @@ Usage:
     hermes claw migrate --dry-run  # Preview migration without changes
 """
 
+# IMPORTANT: hermes_bootstrap must be the very first import — it sets up
+# UTF-8 stdio on Windows so print()/subprocess children don't hit
+# UnicodeEncodeError with non-ASCII characters.  No-op on POSIX.
+#
+# Guarded against ModuleNotFoundError because ``hermes_bootstrap`` is a
+# top-level module registered via pyproject.toml's ``py-modules`` list.
+# When the user upgrades code via ``git pull`` (or ``hermes update``
+# crashes between ``git reset --hard`` and ``uv pip install -e .``), the
+# new code references ``hermes_bootstrap`` but the editable install's
+# ``.pth`` file still points at the old set of top-level modules.  Without
+# this guard, hermes crashes on import and the user can't run
+# ``hermes update`` to recover.  Missing the bootstrap means UTF-8 stdio
+# setup is skipped on Windows — degraded, not broken.  POSIX is unaffected.
+try:
+    import hermes_bootstrap  # noqa: F401
+except ModuleNotFoundError:
+    pass
+
 import argparse
 import json
 import os
@@ -230,6 +248,7 @@ except Exception:
     pass  # best-effort — don't crash if config isn't available yet
 
 import logging
+import threading
 import time as _time
 from datetime import datetime
 
@@ -1706,7 +1725,7 @@ def _is_profile_api_key_provider(provider_id: str) -> bool:
     """Return True when provider_id maps to a profile with auth_type='api_key'.
 
     Used as a catch-all in select_provider_and_model() so that new providers
-    declared in providers/*.py automatically dispatch to _model_flow_api_key_provider
+    declared in plugins/model-providers/<name>/ automatically dispatch to _model_flow_api_key_provider
     without requiring an explicit elif branch here.
     """
     try:
@@ -5344,11 +5363,16 @@ def cmd_version(args):
     # Show Python version
     print(f"Python: {sys.version.split()[0]}")
 
-    # Check for key dependencies
+    # Check for key dependencies.  Use importlib.metadata rather than
+    # ``import openai`` — the SDK drags in ~800ms of pydantic-backed type
+    # modules just to expose ``__version__``.  Metadata lookup is ~2ms.
     try:
-        import openai
+        from importlib.metadata import version as _pkg_version, PackageNotFoundError
 
-        print(f"OpenAI SDK: {openai.__version__}")
+        try:
+            print(f"OpenAI SDK: {_pkg_version('openai')}")
+        except PackageNotFoundError:
+            print("OpenAI SDK: Not installed")
     except ImportError:
         print("OpenAI SDK: Not installed")
 
@@ -5781,16 +5805,14 @@ def _kill_stale_dashboard_processes(
         while pending and _time.monotonic() < deadline:
             _time.sleep(0.1)
             still_pending = []
+            # On Windows, os.kill(pid, 0) is NOT a no-op. Route through
+            # the cross-platform existence check.
+            from gateway.status import _pid_exists
             for pid in pending:
-                try:
-                    os.kill(pid, 0)  # probe
-                except ProcessLookupError:
-                    killed.append(pid)
-                except (PermissionError, OSError):
-                    # Can't probe — assume still there.
+                if _pid_exists(pid):
                     still_pending.append(pid)
                 else:
-                    still_pending.append(pid)
+                    killed.append(pid)
             pending = still_pending
 
         # SIGKILL any survivors.
@@ -5901,16 +5923,19 @@ def _update_via_zip(args):
     # individually so update does not silently strip working capabilities.
     print("→ Updating Python dependencies...")
 
-    uv_bin = shutil.which("uv")
+    pip_cmd = [sys.executable, "-m", "pip"]
+    uv_bin = shutil.which("uv") or _ensure_uv_for_termux(pip_cmd)
     if uv_bin:
         uv_env = {**os.environ, "VIRTUAL_ENV": str(PROJECT_ROOT / "venv")}
+        if _is_termux_env(uv_env):
+            uv_env.pop("PYTHONPATH", None)
+            uv_env.pop("PYTHONHOME", None)
         _install_python_dependencies_with_optional_fallback([uv_bin, "pip"], env=uv_env)
     else:
         # Use sys.executable to explicitly call the venv's pip module,
         # avoiding PEP 668 'externally-managed-environment' errors on Debian/Ubuntu.
         # Some environments lose pip inside the venv; bootstrap it back with
         # ensurepip before trying the editable install.
-        pip_cmd = [sys.executable, "-m", "pip"]
         try:
             subprocess.run(
                 pip_cmd + ["--version"],
@@ -6445,17 +6470,68 @@ def _load_installable_optional_extras() -> list[str]:
     return referenced
 
 
+def _run_install_with_heartbeat(
+    cmd: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    heartbeat_interval_seconds: int = 30,
+) -> None:
+    """Run dependency install command with periodic heartbeat output.
+
+    Some resolvers/build backends (especially when compiling Rust/C extensions)
+    can stay quiet for minutes. Emit a simple elapsed-time heartbeat so users
+    know ``hermes update`` is still progressing even if pip/uv itself is silent.
+    """
+    done = threading.Event()
+    start = _time.time()
+
+    def _heartbeat() -> None:
+        # Wait first, then print, so short installs don't emit noise.
+        while not done.wait(heartbeat_interval_seconds):
+            elapsed = int(_time.time() - start)
+            print(
+                f"  … still installing dependencies ({elapsed}s elapsed)"
+                " — compiling Rust/C extensions can take several minutes",
+                flush=True,
+            )
+
+    t = threading.Thread(target=_heartbeat, daemon=True)
+    t.start()
+    try:
+        subprocess.run(
+            cmd,
+            cwd=PROJECT_ROOT,
+            check=True,
+            env=env,
+        )
+    finally:
+        done.set()
+        t.join(timeout=0.2)
+
+
 def _install_python_dependencies_with_optional_fallback(
     install_cmd_prefix: list[str],
     *,
     env: dict[str, str] | None = None,
 ) -> None:
-    """Install base deps plus as many optional extras as the environment supports."""
+    """Install base deps plus as many optional extras as the environment supports.
+
+    We intentionally do NOT pass ``--quiet`` to pip. On platforms without
+    prebuilt wheels for some extras (Termux/Android aarch64, older musl
+    distros, fresh Raspberry Pi) pip has to compile C/Rust extensions from
+    source, which can take several minutes with zero network activity.
+    Without progress output the call looks like a hang and users Ctrl+C it.
+    Pip's default output is proportional to actual work (one line per
+    Collecting/Building/Installing step), so keeping it visible costs
+    nothing on fast hardware and prevents the "hermes update hangs" reports
+    on slow hardware.
+
+    We also add periodic heartbeat lines in case the resolver/build backend is
+    itself silent for long stretches.
+    """
     try:
-        subprocess.run(
-            install_cmd_prefix + ["install", "-e", ".[all]", "--quiet"],
-            cwd=PROJECT_ROOT,
-            check=True,
+        _run_install_with_heartbeat(
+            install_cmd_prefix + ["install", "-e", ".[all]"],
             env=env,
         )
         return
@@ -6464,10 +6540,8 @@ def _install_python_dependencies_with_optional_fallback(
             "  ⚠ Optional extras failed, reinstalling base dependencies and retrying extras individually..."
         )
 
-    subprocess.run(
-        install_cmd_prefix + ["install", "-e", ".", "--quiet"],
-        cwd=PROJECT_ROOT,
-        check=True,
+    _run_install_with_heartbeat(
+        install_cmd_prefix + ["install", "-e", "."],
         env=env,
     )
 
@@ -6475,10 +6549,8 @@ def _install_python_dependencies_with_optional_fallback(
     installed_extras: list[str] = []
     for extra in _load_installable_optional_extras():
         try:
-            subprocess.run(
-                install_cmd_prefix + ["install", "-e", f".[{extra}]", "--quiet"],
-                cwd=PROJECT_ROOT,
-                check=True,
+            _run_install_with_heartbeat(
+                install_cmd_prefix + ["install", "-e", f".[{extra}]"],
                 env=env,
             )
             installed_extras.append(extra)
@@ -6493,6 +6565,25 @@ def _install_python_dependencies_with_optional_fallback(
         print(
             f"  ⚠ Skipped optional extras that still failed: {', '.join(failed_extras)}"
         )
+
+
+def _is_termux_env(env: dict[str, str] | None = None) -> bool:
+    check = env or os.environ
+    prefix = str(check.get("PREFIX", ""))
+    return "com.termux" in prefix or prefix.startswith("/data/data/com.termux/")
+
+
+def _ensure_uv_for_termux(pip_cmd: list[str]) -> str | None:
+    """Best-effort uv bootstrap on Termux for faster update installs."""
+    uv_bin = shutil.which("uv")
+    if uv_bin or not _is_termux_env():
+        return uv_bin
+    try:
+        print("  → Termux detected: trying to install uv for faster dependency updates...")
+        subprocess.run(pip_cmd + ["install", "uv"], cwd=PROJECT_ROOT, check=False)
+    except Exception:
+        pass
+    return shutil.which("uv")
 
 
 def _update_node_dependencies() -> None:
@@ -6787,7 +6878,7 @@ def _ensure_fhs_path_guard() -> None:
     if sys.platform != "linux":
         return
     try:
-        if os.geteuid() != 0:
+        if os.geteuid() != 0:  # windows-footgun: ok — Linux FHS helper, guarded by sys.platform == "linux" above + AttributeError catch
             return
     except AttributeError:
         return
@@ -7235,9 +7326,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # breaks on this machine, keep base deps and reinstall the remaining extras
         # individually so update does not silently strip working capabilities.
         print("→ Updating Python dependencies...")
-        uv_bin = shutil.which("uv")
+        pip_cmd = [sys.executable, "-m", "pip"]
+        uv_bin = shutil.which("uv") or _ensure_uv_for_termux(pip_cmd)
         if uv_bin:
             uv_env = {**os.environ, "VIRTUAL_ENV": str(PROJECT_ROOT / "venv")}
+            if _is_termux_env(uv_env):
+                uv_env.pop("PYTHONPATH", None)
+                uv_env.pop("PYTHONHOME", None)
             _install_python_dependencies_with_optional_fallback(
                 [uv_bin, "pip"], env=uv_env
             )
@@ -7320,7 +7415,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 for p in all_profiles:
                     try:
                         r = seed_profile_skills(p.path, quiet=True)
-                        if r:
+                        if r and r.get("skipped_opt_out"):
+                            status = "opted out (--no-skills)"
+                        elif r:
                             copied = len(r.get("copied", []))
                             updated = len(r.get("updated", []))
                             modified = len(r.get("user_modified", []))
@@ -7391,11 +7488,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     .lower()
                 )
             elif not (sys.stdin.isatty() and sys.stdout.isatty()):
-                print("  ℹ Non-interactive session — skipping config migration prompt.")
-                print(
-                    "    Run 'hermes config migrate' later to apply any new config/env options."
-                )
-                response = "n"
+                print("  ℹ Non-interactive session — applying safe config migrations.")
+                response = "auto"
             else:
                 try:
                     response = (
@@ -7406,19 +7500,22 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 except EOFError:
                     response = "n"
 
-            if response in ("", "y", "yes"):
+            if response in ("", "y", "yes", "auto"):
                 print()
-                # In gateway mode OR under --yes, run auto-migrations only (no
-                # input() prompts for API keys which would hang the detached
-                # process / defeat the point of --yes).
-                results = migrate_config(
-                    interactive=not (gateway_mode or assume_yes), quiet=False
+                # Gateway mode, --yes, and non-interactive update contexts
+                # (dashboard / web server actions) cannot prompt for API keys.
+                # Still run the non-interactive migration pass before restarting
+                # so new default config fields and version bumps are written
+                # before the freshly updated gateway validates config at startup.
+                interactive_migration = not (
+                    gateway_mode or assume_yes or response == "auto"
                 )
+                results = migrate_config(interactive=interactive_migration, quiet=False)
 
                 if results["env_added"] or results["config_added"]:
                     print()
                     print("✓ Configuration updated!")
-                if (gateway_mode or assume_yes) and missing_env:
+                if (gateway_mode or assume_yes or response == "auto") and missing_env:
                     print("  ℹ API keys require manual entry: hermes config migrate")
             else:
                 print()
@@ -7685,14 +7782,56 @@ def _cmd_update_impl(args, gateway_mode: bool):
                                 )
 
                             if _graceful_ok:
-                                # Gateway exited 75; systemd should relaunch
-                                # via Restart=on-failure.  The unit's
-                                # RestartSec (default 30s on ours) gates the
-                                # respawn — poll past that + slack so we
-                                # don't give up mid-cooldown and falsely
-                                # print "drained but didn't relaunch".  For
-                                # units without RestartSec set we fall back
-                                # to the original 10s budget.
+                                # Gateway exited 75. ``Restart=always`` +
+                                # ``RestartForceExitStatus=75`` means systemd
+                                # WILL respawn the unit — but only after
+                                # ``RestartSec`` (default 60s on our unit
+                                # file). That 60s wait is a crash-loop guard,
+                                # and is the right default when the gateway
+                                # dies unexpectedly. For a voluntary restart
+                                # on update, it's dead time the user watches.
+                                #
+                                # Shortcut it: ``reset-failed`` + ``start``
+                                # skips RestartSec entirely (we're manually
+                                # initiating the unit, not waiting for
+                                # systemd's auto-restart logic). Takes about
+                                # as long as the process takes to come up
+                                # (~1-3s on a warm box).
+                                #
+                                # If the unit is already active because
+                                # RestartSec elapsed while we were draining,
+                                # ``start`` is a no-op and we fall through to
+                                # the poll below. Either way we collapse the
+                                # 60s+ delay to a ~5s one.
+                                subprocess.run(
+                                    scope_cmd + ["reset-failed", svc_name],
+                                    capture_output=True,
+                                    text=True,
+                                    timeout=10,
+                                )
+                                subprocess.run(
+                                    scope_cmd + ["start", svc_name],
+                                    capture_output=True,
+                                    text=True,
+                                    timeout=15,
+                                )
+                                # Short poll: the gateway should be up within
+                                # a few seconds now that we bypassed
+                                # RestartSec. Fall back to the longer
+                                # RestartSec + slack budget ONLY if the
+                                # explicit start failed and we need to rely
+                                # on systemd's auto-restart.
+                                if _wait_for_service_active(
+                                    scope_cmd,
+                                    svc_name,
+                                    timeout=10.0,
+                                ):
+                                    restarted_services.append(svc_name)
+                                    continue
+                                # Explicit start didn't take. Fall back to
+                                # the original passive poll (systemd's
+                                # auto-restart WILL fire after RestartSec
+                                # regardless).
                                 _restart_sec = _service_restart_sec(
                                     scope_cmd,
                                     svc_name,
@@ -7722,6 +7861,23 @@ def _cmd_update_impl(args, gateway_mode: bool):
                             # when the graceful path failed (unit missing
                             # SIGUSR1 wiring, drain exceeded the budget,
                             # restart-policy mismatch).
+                            #
+                            # Always `reset-failed` first.  If systemd's own
+                            # auto-restart attempts already parked the unit
+                            # in a failed state (transient CHDIR / OOM /
+                            # filesystem race after our drain + exit-75),
+                            # a plain `systemctl restart` can wedge against
+                            # the RestartSec backoff and leave the unit
+                            # dead.  Clearing the failed state first makes
+                            # the restart idempotent.  Mirrors the recovery
+                            # path in `hermes gateway restart`
+                            # (`systemd_restart()`) as of PR #20949.
+                            subprocess.run(
+                                scope_cmd + ["reset-failed", svc_name],
+                                capture_output=True,
+                                text=True,
+                                timeout=10,
+                            )
                             restart = subprocess.run(
                                 scope_cmd + ["restart", svc_name],
                                 capture_output=True,
@@ -7741,9 +7897,18 @@ def _cmd_update_impl(args, gateway_mode: bool):
                                 else:
                                     # Retry once — transient startup failures
                                     # (stale module cache, import race) often
-                                    # resolve on the second attempt.
+                                    # resolve on the second attempt.  Again
+                                    # clear any failed state first so the
+                                    # retry isn't blocked by the previous
+                                    # crash.
                                     print(
                                         f"  ⚠ {svc_name} died after restart, retrying..."
+                                    )
+                                    subprocess.run(
+                                        scope_cmd + ["reset-failed", svc_name],
+                                        capture_output=True,
+                                        text=True,
+                                        timeout=10,
                                     )
                                     subprocess.run(
                                         scope_cmd + ["restart", svc_name],
@@ -7759,10 +7924,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
                                         restarted_services.append(svc_name)
                                         print(f"  ✓ {svc_name} recovered on retry")
                                     else:
+                                        _scope_flag = "--user " if scope == "user" else ""
                                         print(
                                             f"  ✗ {svc_name} failed to stay running after restart.\n"
-                                            f"    Check logs: journalctl --user -u {svc_name} --since '2 min ago'\n"
-                                            f"    Restart manually: systemctl {'--user ' if scope == 'user' else ''}restart {svc_name}"
+                                            f"    Check logs: journalctl {_scope_flag}-u {svc_name} --since '2 min ago'\n"
+                                            f"    Recover manually:\n"
+                                            f"      systemctl {_scope_flag}reset-failed {svc_name}\n"
+                                            f"      systemctl {_scope_flag}restart {svc_name}"
                                         )
                             else:
                                 print(
@@ -7886,10 +8054,15 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     print(
                         f"  ⚠ {len(_stuck)} gateway process(es) ignored SIGTERM — force-killing"
                     )
+                    from gateway.status import terminate_pid as _terminate_pid
                     for pid in _stuck:
                         try:
-                            os.kill(pid, _signal.SIGKILL)
-                        except (ProcessLookupError, PermissionError):
+                            # Routes through taskkill /T /F on Windows,
+                            # SIGKILL on POSIX — _signal.SIGKILL doesn't
+                            # exist on Windows so the old raw os.kill call
+                            # used to crash the entire update path.
+                            _terminate_pid(pid, force=True)
+                        except (ProcessLookupError, PermissionError, OSError):
                             pass
                     # Give the OS a beat to reap the processes so the
                     # watchers see them exit and respawn.
@@ -8078,8 +8251,14 @@ def cmd_profile(args):
             return
 
         # Header
-        print(f"\n {'Profile':<16} {'Model':<28} {'Gateway':<12} {'Alias'}")
-        print(f" {'─' * 15}    {'─' * 27}    {'─' * 11}    {'─' * 12}")
+        print(
+            f"\n {'Profile':<16} {'Model':<28} {'Gateway':<12} "
+            f"{'Alias':<12} {'Distribution'}"
+        )
+        print(
+            f" {'─' * 15}    {'─' * 27}    {'─' * 11}    "
+            f"{'─' * 11}    {'─' * 20}"
+        )
 
         for p in profiles:
             marker = (
@@ -8093,7 +8272,12 @@ def cmd_profile(args):
             alias = p.name if p.alias_path else "—"
             if p.is_default:
                 alias = "—"
-            print(f"{marker}{name:<15} {model:<28} {gw:<12} {alias}")
+            if p.distribution_name:
+                dist = f"{p.distribution_name}@{p.distribution_version or '?'}"
+                dist = dist[:30]
+            else:
+                dist = "—"
+            print(f"{marker}{name:<15} {model:<28} {gw:<12} {alias:<12} {dist}")
         print()
 
     elif action == "use":
@@ -8113,6 +8297,7 @@ def cmd_profile(args):
         clone = getattr(args, "clone", False)
         clone_all = getattr(args, "clone_all", False)
         no_alias = getattr(args, "no_alias", False)
+        no_skills = getattr(args, "no_skills", False)
 
         try:
             clone_from = getattr(args, "clone_from", None)
@@ -8123,6 +8308,7 @@ def cmd_profile(args):
                 clone_all=clone_all,
                 clone_config=clone,
                 no_alias=no_alias,
+                no_skills=no_skills,
             )
             print(f"\nProfile '{name}' created at {profile_dir}")
 
@@ -8147,10 +8333,17 @@ def cmd_profile(args):
                 except Exception:
                     pass  # Honcho plugin not installed or not configured
 
-            # Seed bundled skills (skip if --clone-all already copied them)
+            # Seed bundled skills (skip if --clone-all already copied them, or
+            # if --no-skills was passed — in which case seed_profile_skills()
+            # honors the marker file and returns skipped_opt_out=True).
             if not clone_all:
                 result = seed_profile_skills(profile_dir)
-                if result:
+                if result and result.get("skipped_opt_out"):
+                    print(
+                        "No bundled skills seeded (--no-skills). "
+                        "Delete .no-bundled-skills in the profile to opt back in."
+                    )
+                elif result:
                     copied = len(result.get("copied", []))
                     print(f"{copied} bundled skills synced.")
                 else:
@@ -8223,6 +8416,7 @@ def cmd_profile(args):
             _read_config_model,
             _check_gateway_running,
             _count_skills,
+            _read_distribution_meta,
         )
 
         if not profile_exists(name):
@@ -8232,6 +8426,7 @@ def cmd_profile(args):
         model, provider = _read_config_model(profile_dir)
         gw = _check_gateway_running(profile_dir)
         skills = _count_skills(profile_dir)
+        dist_name, dist_version, dist_source = _read_distribution_meta(profile_dir)
         wrapper = _get_wrapper_dir() / name
 
         print(f"\nProfile: {name}")
@@ -8246,6 +8441,11 @@ def cmd_profile(args):
         print(
             f"SOUL.md: {'exists' if (profile_dir / 'SOUL.md').exists() else 'not configured'}"
         )
+        if dist_name:
+            print(f"Distribution: {dist_name}@{dist_version or '?'}")
+            if dist_source:
+                print(f"Installed from: {dist_source}")
+            print(f"  (run `hermes profile info {name}` for full manifest)")
         if wrapper.exists():
             print(f"Alias:   {wrapper}")
         print()
@@ -8325,6 +8525,208 @@ def cmd_profile(args):
         except (ValueError, FileExistsError, FileNotFoundError) as e:
             print(f"Error: {e}")
             sys.exit(1)
+
+    elif action == "install":
+        import tempfile
+        from hermes_cli.profile_distribution import (
+            plan_install,
+            install_distribution,
+            DistributionError,
+        )
+
+        try:
+            # Preview: stage the distribution into a scratch dir, show the
+            # manifest, then do the real install.  The double-stage avoids
+            # any side-effects if the user declines.
+            with tempfile.TemporaryDirectory(prefix="hermes_dist_preview_") as tmp:
+                plan = plan_install(
+                    args.source,
+                    Path(tmp),
+                    override_name=getattr(args, "install_name", None),
+                )
+                _render_distribution_plan(plan)
+
+                if not getattr(args, "yes", False):
+                    try:
+                        answer = input("\nProceed with install? [y/N] ").strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        answer = ""
+                    if answer not in ("y", "yes"):
+                        print("Install cancelled.")
+                        return
+
+            plan = install_distribution(
+                args.source,
+                name=getattr(args, "install_name", None),
+                force=getattr(args, "force", False),
+                create_alias=getattr(args, "alias", False),
+            )
+            print(f"\n✓ Installed '{plan.manifest.name}' v{plan.manifest.version}")
+            print(f"  Profile path: {plan.target_dir}")
+            if plan.manifest.env_requires:
+                print(
+                    f"  Next: copy .env.EXAMPLE to .env and fill in required keys:\n"
+                    f"    {plan.target_dir}/.env.EXAMPLE"
+                )
+            if plan.has_cron:
+                print(
+                    "  Cron jobs were included but are NOT scheduled automatically.\n"
+                    f"  Review them with:  hermes -p {plan.manifest.name} cron list"
+                )
+            print(f"\n  Use with:      hermes -p {plan.manifest.name} chat")
+        except (DistributionError, ValueError) as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+
+    elif action == "update":
+        from hermes_cli.profile_distribution import (
+            update_distribution,
+            read_manifest,
+            DistributionError,
+        )
+        from hermes_cli.profiles import get_profile_dir, normalize_profile_name
+
+        name = args.profile_name
+        try:
+            canon = normalize_profile_name(name)
+            current = read_manifest(get_profile_dir(canon))
+            if current is None:
+                print(
+                    f"Error: Profile '{canon}' is not a distribution (no distribution.yaml). "
+                    "Only profiles installed via `hermes profile install` can be updated."
+                )
+                sys.exit(1)
+
+            force_config = getattr(args, "force_config", False)
+            if not getattr(args, "yes", False):
+                print(f"\nUpdate '{canon}' from: {current.source or '(no source)'}")
+                print(f"  Currently at version {current.version}")
+                if force_config:
+                    print("  --force-config set: config.yaml WILL be overwritten.")
+                else:
+                    print("  config.yaml will be preserved (pass --force-config to overwrite).")
+                print("  User data (memories, sessions, auth, .env) will NOT be touched.")
+                try:
+                    answer = input("\nProceed? [y/N] ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    answer = ""
+                if answer not in ("y", "yes"):
+                    print("Update cancelled.")
+                    return
+
+            plan = update_distribution(canon, force_config=force_config)
+            print(f"\n✓ Updated '{plan.manifest.name}' → v{plan.manifest.version}")
+            if plan.has_cron:
+                print(
+                    "  Cron files were refreshed.  Review with:  "
+                    f"hermes -p {plan.manifest.name} cron list"
+                )
+        except (DistributionError, ValueError) as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+
+    elif action == "info":
+        from hermes_cli.profile_distribution import describe_distribution, DistributionError
+
+        try:
+            data = describe_distribution(args.profile_name)
+        except (DistributionError, ValueError) as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+        if not data:
+            print(
+                f"Profile '{args.profile_name}' is not a distribution "
+                "(no distribution.yaml)."
+            )
+            return
+        print(f"\nDistribution: {data.get('name')}")
+        print(f"Version:      {data.get('version', '?')}")
+        if data.get("description"):
+            print(f"Description:  {data['description']}")
+        if data.get("author"):
+            print(f"Author:       {data['author']}")
+        if data.get("license"):
+            print(f"License:      {data['license']}")
+        if data.get("hermes_requires"):
+            print(f"Requires:     Hermes {data['hermes_requires']}")
+        if data.get("source"):
+            print(f"Source:       {data['source']}")
+        if data.get("installed_at"):
+            print(f"Installed:    {data['installed_at']}")
+        env_reqs = data.get("env_requires") or []
+        if env_reqs:
+            print("\nEnvironment variables:")
+            for er in env_reqs:
+                tag = "required" if er.get("required", True) else "optional"
+                line = f"  {er['name']} ({tag})"
+                if er.get("description"):
+                    line += f" — {er['description']}"
+                print(line)
+                if er.get("default") is not None:
+                    print(f"      default: {er['default']}")
+        print()
+
+
+def _render_distribution_plan(plan) -> None:
+    """Print a human-readable summary of a pending distribution install."""
+    from hermes_cli.profile_distribution import MANIFEST_FILENAME
+    mf = plan.manifest
+    print(f"\nDistribution: {mf.name} v{mf.version}")
+    if mf.description:
+        print(f"  {mf.description}")
+    if mf.author:
+        print(f"  Author:   {mf.author}")
+    if mf.hermes_requires:
+        print(f"  Requires: Hermes {mf.hermes_requires}")
+    print(f"  Source:   {plan.provenance}")
+    print(f"  Target:   {plan.target_dir}")
+    if plan.existing:
+        # Distinguish "updating an existing distribution" (well-understood
+        # semantics — dist-owned overwritten, config preserved, user data
+        # untouched) from "overwriting a hand-built plain profile" (same
+        # mechanics but the user didn't sign up for this when they created
+        # the profile manually).
+        existing_is_distribution = (plan.target_dir / MANIFEST_FILENAME).is_file()
+        if existing_is_distribution:
+            print("  (profile exists — will overwrite distribution-owned files only)")
+        else:
+            print(
+                "  ⚠ Profile exists but is NOT a distribution.  Installing here will\n"
+                "    overwrite its SOUL.md, skills/, cron/, and mcp.json.\n"
+                "    Your memories, sessions, auth.json, and .env will be preserved,\n"
+                "    but any hand-edits to distribution-owned files will be lost."
+            )
+    if mf.env_requires:
+        print("\n  Env vars:")
+        for er in mf.env_requires:
+            tag = "required" if er.required else "optional"
+            # Check both the current shell environment and the target profile's
+            # .env file so we don't nag about keys the user already has set up.
+            already = os.environ.get(er.name) is not None
+            if not already and plan.target_dir.is_dir():
+                env_path = plan.target_dir / ".env"
+                if env_path.is_file():
+                    try:
+                        for raw in env_path.read_text().splitlines():
+                            line = raw.strip()
+                            if not line or line.startswith("#"):
+                                continue
+                            key = line.split("=", 1)[0].strip()
+                            if key == er.name:
+                                already = True
+                                break
+                    except OSError:
+                        pass
+            status = "✓ set" if already else ("needs setting" if er.required else "—")
+            line = f"    • {er.name} ({tag}, {status})"
+            if er.description:
+                line += f" — {er.description}"
+            print(line)
+    if plan.has_cron:
+        print(
+            "\n  ⚠ This distribution ships cron jobs.  They will NOT run "
+            "automatically — review and enable manually."
+        )
 
 
 def _report_dashboard_status() -> int:
@@ -8464,8 +8866,122 @@ def _build_provider_choices() -> list[str]:
         ]
 
 
+# Top-level subcommands that argparse knows about WITHOUT running plugin
+# discovery.  Used to short-circuit eager plugin imports (which can take
+# 500ms+ pulling in google.cloud.pubsub_v1, aiohttp, grpc, etc.) when the
+# user's invocation clearly doesn't need any plugin-registered subcommand.
+#
+# Keep this in sync with the ``subparsers.add_parser("NAME", ...)`` calls
+# below in ``main()``. Missing an entry here only costs a one-time
+# discovery; extra entries here would let a plugin command silently fail
+# to parse.
+_BUILTIN_SUBCOMMANDS = frozenset(
+    {
+        "acp", "auth", "backup", "checkpoints", "claw", "completion",
+        "config", "cron", "curator", "dashboard", "debug", "doctor",
+        "dump", "fallback", "gateway", "hooks", "import", "insights",
+        "kanban", "login", "logout", "logs", "mcp", "memory", "model",
+        "pairing", "plugins", "profile", "sessions", "setup", "skills",
+        "slack", "status", "tools", "uninstall", "update", "version",
+        "webhook", "whatsapp", "chat",
+        # Help-ish invocations — plugin commands not being listed in
+        # top-level --help is an acceptable trade-off for skipping an
+        # expensive eager import of every bundled plugin module.
+        "help",
+    }
+)
+
+
+# Top-level flags that take a value. Needed by ``_first_positional_argv``
+# so that in ``hermes -m gpt5 chat``, ``gpt5`` is correctly skipped as a
+# flag value rather than misclassified as a subcommand. Kept in sync with
+# the top-level flags declared in ``hermes_cli/_parser.py``.
+#
+# Correctness-safe either way: missing an entry here only makes the
+# fast-path bail out too eagerly (we run plugin discovery when we didn't
+# need to); extra entries would make us skip a real positional.
+_TOP_LEVEL_VALUE_FLAGS = frozenset(
+    {
+        "-z", "--oneshot",
+        "-m", "--model",
+        "--provider",
+        "-t", "--toolsets",
+        "-r", "--resume",
+        "-s", "--skills",
+        # ``-c / --continue`` is nargs='?' (optional value). Treat it as
+        # value-taking: if the next token is a subcommand-looking word
+        # the user almost certainly meant it as the session name, and
+        # either interpretation keeps us on the safe side.
+        "-c", "--continue",
+    }
+)
+
+
+def _first_positional_argv() -> str | None:
+    """Return the first non-flag, non-flag-value token in ``sys.argv[1:]``.
+
+    Used by ``main()`` to decide whether plugin discovery has to run at
+    argparse-setup time. Handles common invocations like
+    ``hermes -m gpt5 --provider openai chat "msg"`` by skipping the
+    values attached to known top-level flags.
+
+    Does NOT fully simulate argparse — unknown ``--foo=bar`` / ``--foo
+    bar`` flags degrade gracefully (``bar`` may be wrongly classified as
+    a positional, which at worst forces a one-time plugin discovery).
+    """
+    argv = sys.argv[1:]
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--":
+            # Everything after ``--`` is positional.
+            if i + 1 < len(argv):
+                return argv[i + 1]
+            return None
+        if tok.startswith("-"):
+            # ``--flag=value`` carries its value inline — single token.
+            if "=" in tok:
+                i += 1
+                continue
+            if tok in _TOP_LEVEL_VALUE_FLAGS and i + 1 < len(argv):
+                i += 2
+                continue
+            i += 1
+            continue
+        return tok
+    return None
+
+
+def _plugin_cli_discovery_needed() -> bool:
+    """True when the CLI might be invoking a plugin-registered subcommand.
+
+    Returning False lets ``main()`` skip plugin discovery entirely during
+    argparse setup, saving ~500-650ms per invocation for users whose
+    enabled plugins don't contribute any CLI command.
+    """
+    first = _first_positional_argv()
+    if first is None:
+        # Bare ``hermes`` or only flags → defaults to ``chat``.
+        return False
+    if first in _BUILTIN_SUBCOMMANDS:
+        return False
+    # Unknown token — could be a plugin subcommand, OR a chat prompt
+    # starting with a non-flag word. Either way we need discovery: if it
+    # IS a plugin command, argparse needs the subparser; if it's a chat
+    # prompt, argparse will route it via positional handling and the
+    # extra discovery cost is amortized over a full agent run anyway.
+    return True
+
+
 def main():
     """Main entry point for hermes CLI."""
+    # Force UTF-8 stdio on Windows before anything prints.  No-op elsewhere.
+    try:
+        from hermes_cli.stdio import configure_windows_stdio
+        configure_windows_stdio()
+    except Exception:
+        pass
+
     from hermes_cli._parser import build_top_level_parser
 
     parser, subparsers, chat_parser = build_top_level_parser()
@@ -8667,6 +9183,9 @@ def main():
         action="store_true",
         help="Target the Linux system-level gateway service",
     )
+
+    # gateway list
+    gateway_subparsers.add_parser("list", help="List all profiles and their gateway status")
 
     # gateway setup
     gateway_subparsers.add_parser("setup", help="Configure messaging platforms")
@@ -9369,6 +9888,20 @@ Examples:
     backup_parser.set_defaults(func=cmd_backup)
 
     # =========================================================================
+    # checkpoints command
+    # =========================================================================
+    checkpoints_parser = subparsers.add_parser(
+        "checkpoints",
+        help="Inspect / prune / clear ~/.hermes/checkpoints/",
+        description="Manage the filesystem checkpoint store — the shadow git "
+        "repo hermes uses to snapshot working directories before "
+        "write_file/patch/terminal calls. Lets you see how much "
+        "space checkpoints occupy, force a prune, or wipe the base.",
+    )
+    from hermes_cli.checkpoints import register_cli as _register_checkpoints_cli
+    _register_checkpoints_cli(checkpoints_parser)
+
+    # =========================================================================
     # import command
     # =========================================================================
     import_parser = subparsers.add_parser(
@@ -9724,20 +10257,46 @@ Examples:
     # Plugin CLI commands — dynamically registered by memory/general plugins.
     # Plugins provide a register_cli(subparser) function that builds their
     # own argparse tree.  No hardcoded plugin commands in main.py.
+    #
+    # Skipped when the invocation is already targeting a known built-in
+    # subcommand — ``hermes --help``, ``hermes version``, ``hermes logs``,
+    # etc.  This avoids eagerly importing every bundled plugin module
+    # (google.cloud.pubsub_v1, aiohttp, grpc, PIL …) which costs
+    # 500-650ms on typical installs.
     # =========================================================================
-    try:
-        from plugins.memory import discover_plugin_cli_commands
+    if _plugin_cli_discovery_needed():
+        try:
+            from plugins.memory import discover_plugin_cli_commands
+            from hermes_cli.plugins import discover_plugins, get_plugin_manager
 
-        for cmd_info in discover_plugin_cli_commands():
-            plugin_parser = subparsers.add_parser(
-                cmd_info["name"],
-                help=cmd_info["help"],
-                description=cmd_info.get("description", ""),
-                formatter_class=__import__("argparse").RawDescriptionHelpFormatter,
-            )
-            cmd_info["setup_fn"](plugin_parser)
-    except Exception as _exc:
-        logging.getLogger(__name__).debug("Plugin CLI discovery failed: %s", _exc)
+            seen_plugin_commands = set()
+            for cmd_info in discover_plugin_cli_commands():
+                plugin_parser = subparsers.add_parser(
+                    cmd_info["name"],
+                    help=cmd_info["help"],
+                    description=cmd_info.get("description", ""),
+                    formatter_class=__import__("argparse").RawDescriptionHelpFormatter,
+                )
+                cmd_info["setup_fn"](plugin_parser)
+                if cmd_info.get("handler_fn") is not None:
+                    plugin_parser.set_defaults(func=cmd_info["handler_fn"])
+                seen_plugin_commands.add(cmd_info["name"])
+
+            discover_plugins()
+            for cmd_info in get_plugin_manager()._cli_commands.values():
+                if cmd_info["name"] in seen_plugin_commands:
+                    continue
+                plugin_parser = subparsers.add_parser(
+                    cmd_info["name"],
+                    help=cmd_info["help"],
+                    description=cmd_info.get("description", ""),
+                    formatter_class=__import__("argparse").RawDescriptionHelpFormatter,
+                )
+                cmd_info["setup_fn"](plugin_parser)
+                if cmd_info.get("handler_fn") is not None:
+                    plugin_parser.set_defaults(func=cmd_info["handler_fn"])
+        except Exception as _exc:
+            logging.getLogger(__name__).debug("Plugin CLI discovery failed: %s", _exc)
 
     # =========================================================================
     # curator command — background skill maintenance
@@ -9971,7 +10530,15 @@ Examples:
     )
     mcp_add_p.add_argument("name", help="Server name (used as config key)")
     mcp_add_p.add_argument("--url", help="HTTP/SSE endpoint URL")
-    mcp_add_p.add_argument("--command", help="Stdio command (e.g. npx)")
+    # dest="mcp_command" so this flag does not clobber the top-level
+    # subparser's args.command attribute, which the dispatcher reads to
+    # route to cmd_mcp.  Without an explicit dest, argparse derives
+    # dest="command" from the flag name and sets it to None when the
+    # flag is omitted, causing `hermes mcp add ...` to fall through to
+    # interactive chat.
+    mcp_add_p.add_argument(
+        "--command", dest="mcp_command", help="Stdio command (e.g. npx)"
+    )
     mcp_add_p.add_argument(
         "--args", nargs="*", default=[], help="Arguments for stdio command"
     )
@@ -10498,6 +11065,11 @@ Examples:
     profile_create.add_argument(
         "--no-alias", action="store_true", help="Skip wrapper script creation"
     )
+    profile_create.add_argument(
+        "--no-skills",
+        action="store_true",
+        help="Create an empty profile with no bundled skills (opts out of `hermes update` skill sync)",
+    )
 
     profile_delete = profile_subparsers.add_parser("delete", help="Delete a profile")
     profile_delete.add_argument("profile_name", help="Profile to delete")
@@ -10544,6 +11116,63 @@ Examples:
         metavar="NAME",
         help="Profile name (default: inferred from archive)",
     )
+
+    # ---------- Distribution subcommands (issue #20456) ----------
+    profile_install = profile_subparsers.add_parser(
+        "install",
+        help="Install a profile distribution from a git URL or local directory",
+        description=(
+            "Install a Hermes profile distribution. SOURCE can be a git URL "
+            "(github.com/user/repo, https://..., git@...) or a local "
+            "directory containing distribution.yaml at its root."
+        ),
+    )
+    profile_install.add_argument(
+        "source",
+        help="Distribution source (git URL or local directory)",
+    )
+    profile_install.add_argument(
+        "--name", dest="install_name", metavar="NAME",
+        help="Override profile name (default: read from manifest)",
+    )
+    profile_install.add_argument(
+        "--alias", action="store_true",
+        help="Create a shell wrapper alias for the installed profile",
+    )
+    profile_install.add_argument(
+        "--force", action="store_true",
+        help="Overwrite an existing profile of the same name (user data preserved)",
+    )
+    profile_install.add_argument(
+        "-y", "--yes", action="store_true",
+        help="Skip manifest preview confirmation",
+    )
+
+    profile_update = profile_subparsers.add_parser(
+        "update",
+        help="Re-pull a distribution and apply updates (user data preserved)",
+        description=(
+            "Fetch the distribution from its recorded source and overwrite "
+            "distribution-owned files (SOUL.md, skills/, cron/, mcp.json). "
+            "User data (memories, sessions, auth, .env) is never touched. "
+            "config.yaml is preserved unless --force-config is passed."
+        ),
+    )
+    profile_update.add_argument("profile_name", help="Profile to update")
+    profile_update.add_argument(
+        "--force-config", action="store_true",
+        help="Also overwrite config.yaml (normally preserved to keep user overrides)",
+    )
+    profile_update.add_argument(
+        "-y", "--yes", action="store_true",
+        help="Skip confirmation",
+    )
+
+    profile_info = profile_subparsers.add_parser(
+        "info",
+        help="Show a profile's distribution manifest (version, requirements, source)",
+    )
+    profile_info.add_argument("profile_name", help="Profile to inspect")
 
     profile_parser.set_defaults(func=cmd_profile)
 

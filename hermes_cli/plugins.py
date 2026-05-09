@@ -80,6 +80,10 @@ VALID_HOOKS: Set[str] = {
     "post_tool_call",
     "transform_terminal_output",
     "transform_tool_result",
+    # Transform LLM output before it's returned to the user.
+    # Plugins return a string to replace the response text, or None/empty to leave unchanged.
+    # First non-None string wins. Useful for vocabulary/personality transformation.
+    "transform_llm_output",
     "pre_llm_call",
     "post_llm_call",
     "pre_api_request",
@@ -866,7 +870,7 @@ class PluginManager:
             if yaml is None:
                 logger.warning("PyYAML not installed – cannot load %s", manifest_file)
                 return None
-            data = yaml.safe_load(manifest_file.read_text()) or {}
+            data = yaml.safe_load(manifest_file.read_text(encoding="utf-8")) or {}
 
             name = data.get("name", plugin_dir.name)
             key = f"{prefix}/{plugin_dir.name}" if prefix else name

@@ -46,6 +46,7 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     ("xiaomi/mimo-v2.5-pro",             ""),
     ("xiaomi/mimo-v2.5",                 ""),
     ("tencent/hy3-preview:free",         "free"),
+    ("tencent/hy3-preview",              ""),
     ("openai/gpt-5.3-codex",            ""),
     ("google/gemini-3-pro-image-preview", ""),
     ("google/gemini-3-flash-preview",   ""),
@@ -412,6 +413,18 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "qwen3-coder-plus",
         "qwen3-coder-next",
         # Third-party models available on coding-intl
+        "glm-5",
+        "glm-4.7",
+        "MiniMax-M2.5",
+    ],
+    # Alibaba Coding Plan — same platform as alibaba (DashScope coding-intl),
+    # separate provider ID with its own base_url_env_var.
+    "alibaba-coding-plan": [
+        "qwen3.6-plus",
+        "qwen3.5-plus",
+        "qwen3-coder-plus",
+        "qwen3-coder-next",
+        "kimi-k2.5",
         "glm-5",
         "glm-4.7",
         "MiniMax-M2.5",
@@ -811,9 +824,9 @@ CANONICAL_PROVIDERS: list[ProviderEntry] = [
 ]
 
 # Auto-extend CANONICAL_PROVIDERS with any provider registered in providers/
-# that is not already in the list above.  Adding providers/*.py is sufficient
-# to expose a new provider in the model picker, /model, and all downstream
-# consumers — no edits to this file needed.
+# that is not already in the list above.  Adding plugins/model-providers/<name>/
+# is sufficient to expose a new provider in the model picker, /model, and all
+# downstream consumers — no edits to this file needed.
 _canonical_slugs = {p.slug for p in CANONICAL_PROVIDERS}
 try:
     from providers import list_providers as _list_providers_for_canonical

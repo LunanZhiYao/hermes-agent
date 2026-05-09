@@ -54,6 +54,7 @@ hermes [global-options] <command> [subcommand/options]
 | `hermes dump` | Copy-pasteable setup summary for support/debugging. |
 | `hermes debug` | Debug tools — upload logs and system info for support. |
 | `hermes backup` | Back up Hermes home directory to a zip file. |
+| `hermes checkpoints` | Inspect / prune / clear `~/.hermes/checkpoints/` (the shadow store used by `/rollback`). Run with no args for a status overview. |
 | `hermes import` | Restore a Hermes backup from a zip file. |
 | `hermes logs` | View, tail, and filter agent/gateway/error log files. |
 | `hermes config` | Show, edit, migrate, and query configuration files. |
@@ -377,6 +378,7 @@ Multi-profile, multi-project collaboration board. Each install can host many boa
 | `tail <id>` | Follow a task's event stream. |
 | `dispatch` | One dispatcher pass on the active board. Flags: `--dry-run`, `--max N`, `--json`. |
 | `context <id>` | Print the full context a worker would see (title + body + parent results + comments). |
+| `specify <id>` / `specify --all` | Flesh out a triage-column task into a concrete spec (title + body with goal, approach, acceptance criteria) via the auxiliary LLM, then promote it to `todo`. Flags: `--tenant` (scope `--all` to one tenant), `--author`, `--json`. Configure the model under `auxiliary.triage_specifier` in `config.yaml`. |
 | `gc` | Remove scratch workspaces for archived tasks. |
 
 Examples:
@@ -579,6 +581,44 @@ hermes backup --quick                   # Quick state-only snapshot
 hermes backup --quick --label "pre-upgrade"  # Quick snapshot with label
 ```
 
+## `hermes checkpoints`
+
+```bash
+hermes checkpoints [COMMAND]
+```
+
+Inspect and manage the shadow git store at `~/.hermes/checkpoints/` — the storage layer behind the in-session `/rollback` command. Safe to run any time; does not require the agent to be running.
+
+| Subcommand | Description |
+|------------|-------------|
+| `status` (default) | Show total size, project count, and per-project breakdown. Bare `hermes checkpoints` is equivalent. |
+| `list` | Alias for `status`. |
+| `prune` | Force a cleanup sweep — delete orphan and stale projects, GC the store, enforce the size cap. Ignores the 24h idempotency marker. |
+| `clear` | Delete the entire checkpoint base. Irreversible; asks for confirmation unless `-f`. |
+| `clear-legacy` | Delete only the `legacy-<timestamp>/` archives produced by the v1→v2 migration. |
+
+### Options
+
+| Option | Subcommand | Description |
+|--------|------------|-------------|
+| `--limit N` | `status`, `list` | Max projects to list (default 20). |
+| `--retention-days N` | `prune` | Drop projects whose `last_touch` is older than N days (default 7). |
+| `--max-size-mb N` | `prune` | After the orphan/stale pass, drop the oldest commit per project until total store size ≤ N MB (default 500). |
+| `--keep-orphans` | `prune` | Skip deleting projects whose working directory no longer exists. |
+| `-f`, `--force` | `clear`, `clear-legacy` | Skip the confirmation prompt. |
+
+### Examples
+
+```bash
+hermes checkpoints                                  # status overview
+hermes checkpoints prune --retention-days 3         # aggressive cleanup
+hermes checkpoints prune --max-size-mb 200          # tighten size cap once
+hermes checkpoints clear-legacy -f                  # drop v1 archive dirs
+hermes checkpoints clear -f                         # wipe everything
+```
+
+See [Checkpoints and `/rollback`](../user-guide/checkpoints-and-rollback.md) for the full architecture and the in-session commands.
+
 ## `hermes import`
 
 ```bash
@@ -763,8 +803,8 @@ The curator is an auxiliary-model background task that periodically reviews agen
 | Subcommand | Description |
 |------------|-------------|
 | `status` | Show curator status and skill stats |
-| `run` | Trigger a curator review now |
-| `run --sync` | Block until the LLM pass finishes |
+| `run` | Trigger a curator review now (blocks until the LLM pass finishes) |
+| `run --background` | Start the LLM pass in a background thread and return immediately |
 | `run --dry-run` | Preview only — produce the review report with no mutations |
 | `backup` | Take a manual tar.gz snapshot of `~/.hermes/skills/` (curator also snapshots automatically before every real run) |
 | `rollback` | Restore `~/.hermes/skills/` from a snapshot (defaults to newest) |
@@ -1037,8 +1077,11 @@ Manage profiles — multiple isolated Hermes instances, each with its own config
 | `show <name>` | Show profile details (home directory, config, etc.). |
 | `alias <name> [--remove] [--name NAME]` | Manage wrapper scripts for quick profile access. |
 | `rename <old> <new>` | Rename a profile. |
-| `export <name> [-o FILE]` | Export a profile to a `.tar.gz` archive. |
-| `import <archive> [--name NAME]` | Import a profile from a `.tar.gz` archive. |
+| `export <name> [-o FILE]` | Export a profile to a `.tar.gz` archive (local backup). |
+| `import <archive> [--name NAME]` | Import a profile from a `.tar.gz` archive (local restore). |
+| `install <source> [--name N] [--alias] [--force] [-y]` | Install a profile distribution from a git URL or local directory. |
+| `update <name> [--force-config] [-y]` | Re-pull a distribution; preserves user data (memories, sessions, auth). |
+| `info <name>` | Show a profile's distribution manifest (version, requirements, source). |
 
 Examples:
 
@@ -1049,6 +1092,8 @@ hermes profile use work
 hermes profile alias work --name h-work
 hermes profile export work -o work-backup.tar.gz
 hermes profile import work-backup.tar.gz --name restored
+hermes profile install github.com/user/my-distro --alias
+hermes profile update work
 hermes -p work chat -q "Hello from work profile"
 ```
 

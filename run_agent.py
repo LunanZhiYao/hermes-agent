@@ -20,6 +20,17 @@ Usage:
     response = agent.run_conversation("Tell me about the latest Python updates")
 """
 
+# IMPORTANT: hermes_bootstrap must be the very first import — UTF-8 stdio
+# on Windows.  No-op on POSIX.  See hermes_bootstrap.py for full rationale.
+try:
+    import hermes_bootstrap  # noqa: F401
+except ModuleNotFoundError:
+    # Graceful fallback when hermes_bootstrap isn't registered in the venv
+    # yet — happens during partial ``hermes update`` where git-reset landed
+    # new code but ``uv pip install -e .`` didn't finish.  Missing bootstrap
+    # means UTF-8 stdio setup is skipped on Windows; POSIX is unaffected.
+    pass
+
 import asyncio
 import base64
 import concurrent.futures
@@ -452,6 +463,90 @@ _SURROGATE_RE = re.compile(r'[\ud800-\udfff]')
 
 
 
+def _is_multimodal_tool_result(value: Any) -> bool:
+    """True if the value is a multimodal tool result envelope.
+
+    Multimodal handlers (e.g. tools/computer_use) return a dict with
+    `_multimodal=True`, a `content` key holding OpenAI-style content
+    parts, and an optional `text_summary` for string-only fallbacks.
+    """
+    return (
+        isinstance(value, dict)
+        and value.get("_multimodal") is True
+        and isinstance(value.get("content"), list)
+    )
+
+
+def _multimodal_text_summary(value: Any) -> str:
+    """Extract a plain text view of a multimodal tool result.
+
+    Used wherever downstream code needs a string — logging, previews,
+    persistence size heuristics, fall-back content for providers that
+    don't support multipart tool messages.
+    """
+    if _is_multimodal_tool_result(value):
+        if value.get("text_summary"):
+            return str(value["text_summary"])
+        parts = []
+        for p in value.get("content") or []:
+            if isinstance(p, dict) and p.get("type") == "text":
+                parts.append(str(p.get("text", "")))
+        if parts:
+            return "\n".join(parts)
+        return "[multimodal tool result]"
+    if isinstance(value, str):
+        return value
+    try:
+        import json as _json
+        return _json.dumps(value, default=str)
+    except Exception:
+        return str(value)
+
+
+def _append_subdir_hint_to_multimodal(value: Dict[str, Any], hint: str) -> None:
+    """Mutate a multimodal tool-result envelope to append a subdir hint.
+
+    The hint is added to the first text part so the model sees it; image
+    parts are left untouched. `text_summary` is also updated for
+    string-fallback callers.
+    """
+    if not _is_multimodal_tool_result(value):
+        return
+    parts = value.get("content") or []
+    for p in parts:
+        if isinstance(p, dict) and p.get("type") == "text":
+            p["text"] = str(p.get("text", "")) + hint
+            break
+    else:
+        parts.insert(0, {"type": "text", "text": hint})
+        value["content"] = parts
+    if isinstance(value.get("text_summary"), str):
+        value["text_summary"] = value["text_summary"] + hint
+
+
+def _trajectory_normalize_msg(msg: Dict[str, Any]) -> Dict[str, Any]:
+    """Strip image blobs from a message for trajectory saving.
+
+    Returns a shallow copy with multimodal tool results replaced by their
+    text_summary, and image parts in content lists replaced by
+    `[screenshot]` placeholders. Keeps the message schema otherwise intact.
+    """
+    if not isinstance(msg, dict):
+        return msg
+    content = msg.get("content")
+    if _is_multimodal_tool_result(content):
+        return {**msg, "content": _multimodal_text_summary(content)}
+    if isinstance(content, list):
+        cleaned = []
+        for p in content:
+            if isinstance(p, dict) and p.get("type") in ("image", "image_url", "input_image"):
+                cleaned.append({"type": "text", "text": "[screenshot]"})
+            else:
+                cleaned.append(p)
+        return {**msg, "content": cleaned}
+    return msg
+
+
 def _sanitize_surrogates(text: str) -> str:
     """Replace lone surrogate code points with U+FFFD (replacement character).
 
@@ -780,6 +875,54 @@ def _sanitize_tools_non_ascii(tools: list) -> bool:
     return _sanitize_structure_non_ascii(tools)
 
 
+def _strip_images_from_messages(messages: list) -> bool:
+    """Remove image_url content parts from all messages in-place.
+
+    Called when a server signals it does not support images (e.g.
+    "Only 'text' content type is supported.").  Mutates messages so the
+    next API call sends text only.
+
+    Preserves message alternation invariants:
+      * ``tool``-role messages whose content was entirely images are replaced
+        with a plaintext placeholder, NOT deleted — deleting them would leave
+        the paired ``tool_call_id`` on the prior assistant message unmatched,
+        which providers reject with HTTP 400.
+      * Non-tool messages whose content becomes empty are dropped.  In
+        practice this only hits synthetic image-only user messages appended
+        for attachment delivery; real user turns always include text.
+
+    Returns True if any image parts were removed.
+    """
+    found = False
+    to_delete = []
+    for i, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        new_parts = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") in ("image_url", "image", "input_image"):
+                found = True
+            else:
+                new_parts.append(part)
+        if len(new_parts) < len(content):
+            if new_parts:
+                msg["content"] = new_parts
+            elif msg.get("role") == "tool":
+                # Preserve tool_call_id linkage — providers require every
+                # assistant tool_call to have a matching tool response.
+                msg["content"] = "[image content removed — server does not support images]"
+            else:
+                # Synthetic image-only user/assistant message with no text;
+                # safe to drop.
+                to_delete.append(i)
+    for i in reversed(to_delete):
+        del messages[i]
+    return found
+
+
 def _sanitize_structure_non_ascii(payload: Any) -> bool:
     """Strip non-ASCII characters from nested dict/list payloads in-place."""
     found = False
@@ -966,7 +1109,9 @@ class AIAgent:
         fallback_model: Dict[str, Any] = None,
         credential_pool=None,
         checkpoints_enabled: bool = False,
-        checkpoint_max_snapshots: int = 50,
+        checkpoint_max_snapshots: int = 20,
+        checkpoint_max_total_size_mb: int = 500,
+        checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
     ):
         """
@@ -1689,6 +1834,8 @@ class AIAgent:
         self._checkpoint_mgr = CheckpointManager(
             enabled=checkpoints_enabled,
             max_snapshots=checkpoint_max_snapshots,
+            max_total_size_mb=checkpoint_max_total_size_mb,
+            max_file_size_mb=checkpoint_max_file_size_mb,
         )
         
         # SQLite session store (optional -- provided by CLI or gateway)
@@ -1897,8 +2044,35 @@ class AIAgent:
                 _aux_context_config = None
         self._aux_compression_context_length_config = _aux_context_config
 
-        # Read explicit context_length override from model config
+        # Read explicit model output-token override from config when the
+        # caller did not pass one directly.
         _model_cfg = _agent_cfg.get("model", {})
+        if self.max_tokens is None and isinstance(_model_cfg, dict):
+            _config_max_tokens = _model_cfg.get("max_tokens")
+            if _config_max_tokens is not None:
+                try:
+                    if isinstance(_config_max_tokens, bool):
+                        raise ValueError
+                    _parsed_max_tokens = int(_config_max_tokens)
+                    if _parsed_max_tokens <= 0:
+                        raise ValueError
+                    self.max_tokens = _parsed_max_tokens
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "Invalid model.max_tokens in config.yaml: %r — "
+                        "must be a positive integer (e.g. 4096). "
+                        "Falling back to provider default.",
+                        _config_max_tokens,
+                    )
+                    print(
+                        f"\n⚠ Invalid model.max_tokens in config.yaml: {_config_max_tokens!r}\n"
+                        f"  Must be a positive integer (e.g. 4096).\n"
+                        f"  Falling back to provider default.\n",
+                        file=sys.stderr,
+                    )
+        self._session_init_model_config["max_tokens"] = self.max_tokens
+
+        # Read explicit context_length override from model config
         if isinstance(_model_cfg, dict):
             _config_context_length = _model_cfg.get("context_length")
         else:
@@ -2355,7 +2529,13 @@ class AIAgent:
         # ── Swap core runtime fields ──
         self.model = new_model
         self.provider = new_provider
-        self.base_url = base_url or self.base_url
+        # Use new base_url when provided; only fall back to current when the
+        # new provider genuinely has no endpoint (e.g. native SDK providers).
+        # Without this guard the old provider's URL (e.g. Ollama's localhost
+        # address) would persist silently after switching to a cloud provider
+        # that returns an empty base_url string.
+        if base_url:
+            self.base_url = base_url
         self.api_mode = api_mode
         # Invalidate transport cache — new api_mode may need a different transport
         if hasattr(self, "_transport_cache"):
@@ -2848,6 +3028,16 @@ class AIAgent:
             url = getattr(self, "_base_url_lower", "") or ""
         return "openai.azure.com" in url
 
+    def _is_github_copilot_url(self, base_url: str = None) -> bool:
+        """Return True when a base URL targets GitHub Copilot's OpenAI-compatible API."""
+        if base_url is not None:
+            hostname = base_url_hostname(base_url)
+        else:
+            hostname = getattr(self, "_base_url_hostname", "") or base_url_hostname(
+                getattr(self, "_base_url_lower", "")
+            )
+        return hostname == "api.githubcopilot.com"
+
     def _resolved_api_call_timeout(self) -> float:
         """Resolve the effective per-call request timeout in seconds.
 
@@ -3024,6 +3214,10 @@ class AIAgent:
     ) -> bool:
         """Return True when this provider/model pair should use Responses API."""
         normalized_provider = (provider or "").strip().lower()
+        # Nous serves GPT-5.x models via its OpenAI-compatible chat
+        # completions endpoint; its /v1/responses endpoint returns 404.
+        if normalized_provider == "nous":
+            return False
         if normalized_provider == "copilot":
             try:
                 from hermes_cli.models import _should_use_copilot_responses_api
@@ -3043,7 +3237,7 @@ class AIAgent:
         OpenAI-compatible endpoint. OpenRouter, local models, and older
         OpenAI models use 'max_tokens'.
         """
-        if self._is_direct_openai_url() or self._is_azure_openai_url():
+        if self._is_direct_openai_url() or self._is_azure_openai_url() or self._is_github_copilot_url():
             return {"max_completion_tokens": value}
         return {"max_tokens": value}
 
@@ -3637,7 +3831,7 @@ class AIAgent:
                 pass
             review_agent = None
             try:
-                with open(os.devnull, "w") as _devnull, \
+                with open(os.devnull, "w", encoding="utf-8") as _devnull, \
                      contextlib.redirect_stdout(_devnull), \
                      contextlib.redirect_stderr(_devnull):
                     # Inherit the parent agent's live runtime (provider, model,
@@ -3788,10 +3982,164 @@ class AIAgent:
 
         Ensures conversations are never lost, even on errors or early returns.
         """
+        self._drop_trailing_empty_response_scaffolding(messages)
         self._apply_persist_user_message_override(messages)
         self._session_messages = messages
         self._save_session_log(messages)
         self._flush_messages_to_session_db(messages, conversation_history)
+
+    def _drop_trailing_empty_response_scaffolding(self, messages: List[Dict]) -> None:
+        """Remove private empty-response retry/failure scaffolding from transcript tails.
+
+        Also rewinds past any trailing tool-result / assistant(tool_calls) pair
+        that the failed iteration left hanging. Without this, the tail ends at
+        a raw ``tool`` message and the next user turn lands as
+        ``...tool, user, user`` — a protocol-invalid sequence that most
+        providers silently reject (returns empty content), causing the
+        empty-retry loop to fire forever. See #<TBD>.
+        """
+        # Pass 1: strip the flagged scaffolding messages themselves.
+        dropped_scaffolding = False
+        while (
+            messages
+            and isinstance(messages[-1], dict)
+            and (
+                messages[-1].get("_empty_recovery_synthetic")
+                or messages[-1].get("_empty_terminal_sentinel")
+            )
+        ):
+            messages.pop()
+            dropped_scaffolding = True
+
+        # Pass 2: if we stripped scaffolding, rewind through any trailing
+        # tool-result messages plus the assistant(tool_calls) message that
+        # produced them. This preserves role alternation so the next user
+        # message follows a user or assistant message, not an orphan tool
+        # result. Only runs when scaffolding was actually present — normal
+        # conversation tails (real tool loops mid-progress) are untouched.
+        if not dropped_scaffolding:
+            return
+
+        # Drop any trailing tool-result messages
+        while (
+            messages
+            and isinstance(messages[-1], dict)
+            and messages[-1].get("role") == "tool"
+        ):
+            messages.pop()
+
+        # Drop the assistant message that issued the tool calls, if the tail
+        # now ends in an assistant-with-tool_calls (the pair that owned the
+        # just-popped tool results). Without this, the tail is
+        # ``assistant(tool_calls=...)`` with no tool answers, which some
+        # providers also reject.
+        if (
+            messages
+            and isinstance(messages[-1], dict)
+            and messages[-1].get("role") == "assistant"
+            and messages[-1].get("tool_calls")
+        ):
+            messages.pop()
+
+    def _repair_message_sequence(self, messages: List[Dict]) -> int:
+        """Collapse malformed role-alternation left in the live history.
+
+        Providers (OpenAI, OpenRouter, Anthropic) expect strict alternation:
+        after the system message, user/tool alternates with assistant, with
+        no two consecutive user messages and no tool-result that doesn't
+        follow an assistant-with-tool_calls. Violations cause silent empty
+        responses on most providers, which triggers the empty-retry loop.
+
+        This runs right before the API call as a defensive belt — by the
+        time it fires, the scaffolding strip should already have prevented
+        most shapes, but external callers (gateway multi-queue replay,
+        session resume, cron, explicit conversation_history passed in by
+        host code) can feed in already-broken histories.
+
+        Repairs applied:
+          1. Stray ``tool`` messages whose ``tool_call_id`` doesn't match
+             any preceding assistant tool_call — dropped.
+          2. Consecutive ``user`` messages — merged with newline separator
+             so no user input is lost.
+
+        Deliberately does NOT rewind orphan ``assistant(tool_calls)+tool``
+        pairs that precede a user message — that pattern IS valid when the
+        previous turn completed normally and the user jumped in to redirect
+        before the model got a continuation turn (the ongoing dialog
+        pattern). The empty-response scaffolding stripper handles the
+        genuinely-broken variant via its flag-gated rewind.
+
+        Returns the number of repairs made (for logging/telemetry).
+        """
+        if not messages:
+            return 0
+
+        repairs = 0
+
+        # Pass 1: drop stray tool messages that don't follow a known
+        # assistant tool_call_id. Uses a rolling set of known ids refreshed
+        # on each assistant message.
+        known_tool_ids: set = set()
+        filtered: List[Dict] = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                filtered.append(msg)
+                continue
+            role = msg.get("role")
+            if role == "assistant":
+                known_tool_ids = set()
+                for tc in (msg.get("tool_calls") or []):
+                    tc_id = tc.get("id") if isinstance(tc, dict) else None
+                    if tc_id:
+                        known_tool_ids.add(tc_id)
+                filtered.append(msg)
+            elif role == "tool":
+                tc_id = msg.get("tool_call_id")
+                if tc_id and tc_id in known_tool_ids:
+                    filtered.append(msg)
+                else:
+                    repairs += 1
+            else:
+                if role == "user":
+                    # A user turn closes the tool-result run; subsequent
+                    # tool messages without a fresh assistant tool_call
+                    # are orphans.
+                    known_tool_ids = set()
+                filtered.append(msg)
+
+        # Pass 2: merge consecutive user messages. Preserves all user input
+        # so nothing the user typed is lost.
+        merged: List[Dict] = []
+        for msg in filtered:
+            if (
+                merged
+                and isinstance(msg, dict)
+                and msg.get("role") == "user"
+                and isinstance(merged[-1], dict)
+                and merged[-1].get("role") == "user"
+            ):
+                prev = merged[-1]
+                prev_content = prev.get("content", "")
+                new_content = msg.get("content", "")
+                # Only merge plain-text content; leave multimodal (list)
+                # content alone — collapsing image/audio blocks risks
+                # mangling the attachment structure.
+                if isinstance(prev_content, str) and isinstance(new_content, str):
+                    prev["content"] = (
+                        (prev_content + "\n\n" + new_content)
+                        if prev_content and new_content
+                        else (prev_content or new_content)
+                    )
+                    repairs += 1
+                    continue
+            merged.append(msg)
+
+        if repairs > 0:
+            # Rewrite in place so downstream paths (persistence, return
+            # value, session DB flush) see the repaired sequence.
+            messages[:] = merged
+
+        return repairs
 
     def _flush_messages_to_session_db(self, messages: List[Dict], conversation_history: List[Dict] = None):
         """Persist any un-flushed messages to the SQLite session store.
@@ -3812,6 +4160,20 @@ class AIAgent:
             for msg in messages[flush_from:]:
                 role = msg.get("role", "unknown")
                 content = msg.get("content")
+                # Persist multimodal tool results as their text summary only —
+                # base64 images would bloat the session DB and aren't useful
+                # for cross-session replay.
+                if _is_multimodal_tool_result(content):
+                    content = _multimodal_text_summary(content)
+                elif isinstance(content, list):
+                    # List of OpenAI-style content parts: strip images, keep text.
+                    _txt = []
+                    for p in content:
+                        if isinstance(p, dict) and p.get("type") == "text":
+                            _txt.append(str(p.get("text", "")))
+                        elif isinstance(p, dict) and p.get("type") in ("image", "image_url", "input_image"):
+                            _txt.append("[screenshot]")
+                    content = "\n".join(_txt) if _txt else None
                 tool_calls_data = None
                 if hasattr(msg, "tool_calls") and isinstance(msg.tool_calls, list) and msg.tool_calls:
                     tool_calls_data = [
@@ -3905,6 +4267,10 @@ class AIAgent:
         Returns:
             List[Dict]: Messages in trajectory format
         """
+        # Normalize multimodal tool results — trajectories are text-only, so
+        # replace image-bearing tool messages with their text_summary to avoid
+        # embedding ~1MB base64 blobs into every saved trajectory.
+        messages = [_trajectory_normalize_msg(m) for m in messages]
         trajectory = []
         
         # Add system message with tool definitions
@@ -4956,6 +5322,12 @@ class AIAgent:
             tool_guidance.append(KANBAN_GUIDANCE)
         if tool_guidance:
             prompt_parts.append(" ".join(tool_guidance))
+
+        # Computer-use (macOS) — goes in as its own block rather than being
+        # merged into tool_guidance because the content is multi-paragraph.
+        if "computer_use" in self.valid_tool_names:
+            from agent.prompt_builder import COMPUTER_USE_GUIDANCE
+            prompt_parts.append(COMPUTER_USE_GUIDANCE)
 
         nous_subscription_prompt = build_nous_subscription_prompt(self.valid_tool_names)
         if nous_subscription_prompt:
@@ -9883,7 +10255,8 @@ class AIAgent:
                     )
 
                 if is_error:
-                    result_preview = function_result[:200] if len(function_result) > 200 else function_result
+                    _err_text = _multimodal_text_summary(function_result)
+                    result_preview = _err_text[:200] if len(_err_text) > 200 else _err_text
                     logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
 
                 if not blocked and self.tool_progress_callback:
@@ -9904,11 +10277,12 @@ class AIAgent:
                 cute_msg = _get_cute_tool_message_impl(name, args, tool_duration, result=function_result)
                 self._safe_print(f"  {cute_msg}")
             elif not self.quiet_mode:
+                _preview_str = _multimodal_text_summary(function_result)
                 if self.verbose_logging:
                     print(f"  ✅ Tool {i+1} completed in {tool_duration:.2f}s")
-                    print(self._wrap_verbose("Result: ", function_result))
+                    print(self._wrap_verbose("Result: ", _preview_str))
                 else:
-                    response_preview = function_result[:self.log_prefix_chars] + "..." if len(function_result) > self.log_prefix_chars else function_result
+                    response_preview = _preview_str[:self.log_prefix_chars] + "..." if len(_preview_str) > self.log_prefix_chars else _preview_str
                     print(f"  ✅ Tool {i+1} completed in {tool_duration:.2f}s - {response_preview}")
 
             self._current_tool = None
@@ -9925,16 +10299,34 @@ class AIAgent:
                 tool_name=name,
                 tool_use_id=tc.id,
                 env=get_active_env(effective_task_id),
-            )
+            ) if not _is_multimodal_tool_result(function_result) else function_result
 
             subdir_hints = self._subdirectory_hints.check_tool_call(name, args)
             if subdir_hints:
-                function_result += subdir_hints
+                if _is_multimodal_tool_result(function_result):
+                    # Append the hint to the text summary part so the model
+                    # still sees it; don't touch the image blocks.
+                    _append_subdir_hint_to_multimodal(function_result, subdir_hints)
+                else:
+                    function_result += subdir_hints
 
+            # Unwrap _multimodal dicts to an OpenAI-style content list so any
+            # vision-capable provider receives [{type:text},{type:image_url}]
+            # rather than a raw Python dict.  The Anthropic adapter already
+            # accepts content lists; vision-capable OpenAI-compatible servers
+            # (mlx-vlm, GPT-4o, …) accept image_url in tool messages natively.
+            # Text-only servers that reject images are handled by the adaptive
+            # _vision_supported recovery in the API retry loop.
+            # String results pass through unchanged.
+            _tool_content = (
+                function_result["content"]
+                if _is_multimodal_tool_result(function_result)
+                else function_result
+            )
             tool_msg = {
                 "role": "tool",
                 "name": name,
-                "content": function_result,
+                "content": _tool_content,
                 "tool_call_id": tc.id,
             }
             messages.append(tool_msg)
@@ -10264,9 +10656,15 @@ class AIAgent:
                     logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
                 tool_duration = time.time() - tool_start_time
 
-            result_preview = function_result if self.verbose_logging else (
-                function_result[:200] if len(function_result) > 200 else function_result
-            )
+            if isinstance(function_result, str):
+                result_preview = function_result if self.verbose_logging else (
+                    function_result[:200] if len(function_result) > 200 else function_result
+                )
+                _result_len = len(function_result)
+            else:
+                # Multimodal dict result (_multimodal=True) — not sliceable as string
+                result_preview = function_result
+                _result_len = len(str(function_result))
 
             # Log tool errors to the persistent error log so [error] tags
             # in the UI always have a corresponding detailed entry on disk.
@@ -10284,7 +10682,7 @@ class AIAgent:
             if _is_error_result:
                 logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
             else:
-                logger.info("tool %s completed (%.2fs, %d chars)", function_name, tool_duration, len(function_result))
+                logger.info("tool %s completed (%.2fs, %d chars)", function_name, tool_duration, _result_len)
 
             if not _execution_blocked and self.tool_progress_callback:
                 try:
@@ -10300,7 +10698,8 @@ class AIAgent:
 
             if self.verbose_logging:
                 logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
-                logging.debug(f"Tool result ({len(function_result)} chars): {function_result}")
+                _log_result = _multimodal_text_summary(function_result)
+                logging.debug(f"Tool result ({len(_log_result)} chars): {_log_result}")
 
             if not _execution_blocked and self.tool_complete_callback:
                 try:
@@ -10313,17 +10712,27 @@ class AIAgent:
                 tool_name=function_name,
                 tool_use_id=tool_call.id,
                 env=get_active_env(effective_task_id),
-            )
+            ) if not _is_multimodal_tool_result(function_result) else function_result
 
             # Discover subdirectory context files from tool arguments
             subdir_hints = self._subdirectory_hints.check_tool_call(function_name, function_args)
             if subdir_hints:
-                function_result += subdir_hints
+                if _is_multimodal_tool_result(function_result):
+                    _append_subdir_hint_to_multimodal(function_result, subdir_hints)
+                else:
+                    function_result += subdir_hints
 
+            # Unwrap _multimodal dicts to an OpenAI-style content list
+            # (see parallel path for rationale). String results pass through.
+            _tool_content = (
+                function_result["content"]
+                if _is_multimodal_tool_result(function_result)
+                else function_result
+            )
             tool_msg = {
                 "role": "tool",
                 "name": function_name,
-                "content": function_result,
+                "content": _tool_content,
                 "tool_call_id": tool_call.id
             }
             messages.append(tool_msg)
@@ -10339,7 +10748,8 @@ class AIAgent:
                     print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s")
                     print(self._wrap_verbose("Result: ", function_result))
                 else:
-                    response_preview = function_result[:self.log_prefix_chars] + "..." if len(function_result) > self.log_prefix_chars else function_result
+                    _fr_str = function_result if isinstance(function_result, str) else str(function_result)
+                    response_preview = _fr_str[:self.log_prefix_chars] + "..." if len(_fr_str) > self.log_prefix_chars else _fr_str
                     print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s - {response_preview}")
 
             if self._interrupt_requested and i < len(assistant_message.tool_calls):
@@ -10369,7 +10779,6 @@ class AIAgent:
         # applied to sequential execution as well.
         if num_tools_seq > 0:
             self._apply_pending_steer_to_tool_results(messages, num_tools_seq)
-
 
 
     def _handle_max_iterations(self, messages: list, api_call_count: int) -> str:
@@ -10654,6 +11063,11 @@ class AIAgent:
         self._unicode_sanitization_passes = 0
         self._tool_guardrails.reset_for_turn()
         self._tool_guardrail_halt_decision = None
+        # True until the server rejects an image_url content part with an error
+        # like "Only 'text' content type is supported."  Set to False on first
+        # rejection and kept False for the rest of the session so we never re-send
+        # images to a text-only endpoint.  Scoped per `_run()` call, not per instance.
+        self._vision_supported = True
 
         # Pre-turn connection health check: detect and clean up dead TCP
         # connections left over from provider outages or dropped streams.
@@ -11076,6 +11490,21 @@ class AIAgent:
                 request_logger.info(
                     "Sanitized %s corrupted tool_call arguments before request (session=%s)",
                     repaired_tool_calls,
+                    self.session_id or "-",
+                )
+
+            # Defensive: repair malformed role-alternation before API call.
+            # Catches cases where the history got wedged into a
+            # ``tool → user`` or ``user → user`` tail (e.g. after empty-
+            # response scaffolding was stripped and a new user message
+            # landed after an orphan tool result). Most providers return
+            # empty content on malformed sequences, which would otherwise
+            # retrigger the empty-retry loop indefinitely.
+            repaired_seq = self._repair_message_sequence(messages)
+            if repaired_seq > 0:
+                request_logger.info(
+                    "Repaired %s message-alternation violations before request (session=%s)",
+                    repaired_seq,
                     self.session_id or "-",
                 )
 
@@ -11917,6 +12346,14 @@ class AIAgent:
                         # deltas instead of double-counting them.
                         if self._session_db and self.session_id:
                             try:
+                                # Ensure the session row exists before attempting UPDATE.
+                                # Under concurrent load (cron/kanban), the initial
+                                # _ensure_db_session() may have failed due to SQLite
+                                # locking.  Retry here so per-call token deltas are
+                                # not silently lost (UPDATE on a non-existent row
+                                # affects 0 rows without error).
+                                if not self._session_db_created:
+                                    self._ensure_db_session()
                                 self._session_db.update_token_counts(
                                     self.session_id,
                                     input_tokens=canonical_usage.input_tokens,
@@ -11935,8 +12372,14 @@ class AIAgent:
                                     model=self.model,
                                     api_call_count=1,
                                 )
-                            except Exception:
-                                pass  # never block the agent loop
+                            except Exception as e:
+                                # Log token persistence failures so they're
+                                # visible in agent.log — silent loss here is
+                                # the root cause of undercounted analytics.
+                                logger.debug(
+                                    "Token persistence failed (session=%s, tokens=%d): %s",
+                                    self.session_id, total_tokens, e,
+                                )
                         
                         if self.verbose_logging:
                             logging.debug(f"Token usage: prompt={usage_dict['prompt_tokens']:,}, completion={usage_dict['completion_tokens']:,}, total={usage_dict['total_tokens']:,}")
@@ -12160,6 +12603,68 @@ class AIAgent:
                                     force=True,
                                 )
                             continue
+
+                    # ── Image-rejection recovery ──────────────────────────────
+                    # Some providers (mlx-lm, text-only endpoints, text-only
+                    # fallbacks on multimodal models) reject any message that
+                    # contains image_url content with a 4xx error like
+                    # "Only 'text' content type is supported."  On first hit,
+                    # strip all images from the message list, mark the session
+                    # as vision-unsupported, and retry with text only.
+                    #
+                    # Detection is best-effort English phrase matching — a
+                    # locale-translated or heavily-reworded upstream error
+                    # will bypass this guard and fall through to the normal
+                    # error handler.  Expand the phrase list when new
+                    # provider wordings are observed in the wild.
+                    _err_body = ""
+                    try:
+                        _err_body = str(getattr(api_error, "body", None) or
+                                        getattr(api_error, "message", None) or
+                                        str(api_error))
+                    except Exception:
+                        pass
+                    _err_status = getattr(api_error, "status_code", None)
+                    _IMAGE_REJECTION_PHRASES = (
+                        "only 'text' content type is supported",
+                        "only text content type is supported",
+                        "image_url is not supported",
+                        "image content is not supported",
+                        "multimodal is not supported",
+                        "multimodal content is not supported",
+                        "multimodal input is not supported",
+                        "vision is not supported",
+                        "vision input is not supported",
+                        "does not support images",
+                        "does not support image input",
+                        "does not support multimodal",
+                        "does not support vision",
+                        "model does not support image",
+                    )
+                    _err_lower = _err_body.lower()
+                    _looks_like_image_rejection = any(
+                        p in _err_lower for p in _IMAGE_REJECTION_PHRASES
+                    )
+                    # 4xx-only gate: never interpret 5xx/timeout as "server
+                    # said no to images" — those are transient and must
+                    # route to the normal retry path.
+                    _status_ok = _err_status is None or (400 <= int(_err_status) < 500)
+                    if (
+                        getattr(self, "_vision_supported", True)
+                        and _looks_like_image_rejection
+                        and _status_ok
+                    ):
+                        self._vision_supported = False
+                        _imgs_removed = _strip_images_from_messages(messages)
+                        if isinstance(api_messages, list):
+                            _strip_images_from_messages(api_messages)
+                        self._vprint(
+                            f"{self.log_prefix}⚠️  Server rejected image content — "
+                            f"switching to text-only mode for this session"
+                            + (". Stripped images from history and retrying." if _imgs_removed else "."),
+                            force=True,
+                        )
+                        continue
 
                     status_code = getattr(api_error, "status_code", None)
                     error_context = self._extract_api_error_context(api_error)
@@ -13702,6 +14207,7 @@ class AIAgent:
                             # APIs reject as an invalid sequence.
                             _nudge_msg = self._build_assistant_message(assistant_message, finish_reason)
                             _nudge_msg["content"] = "(empty)"
+                            _nudge_msg["_empty_recovery_synthetic"] = True
                             messages.append(_nudge_msg)
                             messages.append({
                                 "role": "user",
@@ -13710,6 +14216,7 @@ class AIAgent:
                                     "empty response. Please process the tool "
                                     "results above and continue with the task."
                                 ),
+                                "_empty_recovery_synthetic": True,
                             })
                             continue
 
@@ -13812,8 +14319,15 @@ class AIAgent:
                         # "(empty)" terminal.
                         _turn_exit_reason = "empty_response_exhausted"
                         reasoning_text = self._extract_reasoning(assistant_message)
+                        self._drop_trailing_empty_response_scaffolding(messages)
                         assistant_msg = self._build_assistant_message(assistant_message, finish_reason)
                         assistant_msg["content"] = "(empty)"
+                        # This is a user-facing failure sentinel for the gateway,
+                        # not real assistant content. Persisting it makes later
+                        # "continue" turns replay assistant("(empty)") as if it
+                        # were a meaningful model response, which can keep long
+                        # tool-heavy sessions stuck in empty-response loops.
+                        assistant_msg["_empty_terminal_sentinel"] = True
                         messages.append(assistant_msg)
 
                         if reasoning_text:
@@ -13886,14 +14400,18 @@ class AIAgent:
                     
                     final_msg = self._build_assistant_message(assistant_message, finish_reason)
 
-                    # Pop thinking-only prefill message(s) before appending
-                    # the final response.  This avoids consecutive assistant
-                    # messages which break strict-alternation providers
-                    # (Anthropic Messages API) and keeps history clean.
+                    # Pop thinking-only prefill and empty-response retry
+                    # scaffolding before appending the final response.  These
+                    # internal turns are only for the next API retry and should
+                    # not become durable transcript context.
                     while (
                         messages
                         and isinstance(messages[-1], dict)
-                        and messages[-1].get("_thinking_prefill")
+                        and (
+                            messages[-1].get("_thinking_prefill")
+                            or messages[-1].get("_empty_recovery_synthetic")
+                            or messages[-1].get("_empty_terminal_sentinel")
+                        )
                     ):
                         messages.pop()
 
@@ -13984,7 +14502,11 @@ class AIAgent:
         # Clean up VM and browser for this task after conversation completes
         self._cleanup_task_resources(effective_task_id)
 
-        # Persist session to both JSON log and SQLite
+        # Persist session to both JSON log and SQLite only after private retry
+        # scaffolding has been removed. Otherwise a later user "continue" turn
+        # can replay assistant("(empty)") / recovery nudges and fall into the
+        # same empty-response loop again.
+        self._drop_trailing_empty_response_scaffolding(messages)
         self._persist_session(messages, conversation_history)
 
         # ── Turn-exit diagnostic log ─────────────────────────────────────
@@ -14030,6 +14552,27 @@ class AIAgent:
             )
         else:
             logger.info(_diag_msg, *_diag_args)
+
+        # Plugin hook: transform_llm_output
+        # Fired once per turn after the tool-calling loop completes.
+        # Plugins can transform the LLM's output text before it's returned.
+        # First hook to return a string wins; None/empty return leaves text unchanged.
+        if final_response and not interrupted:
+            try:
+                from hermes_cli.plugins import invoke_hook as _invoke_hook
+                _transform_results = _invoke_hook(
+                    "transform_llm_output",
+                    response_text=final_response,
+                    session_id=self.session_id or "",
+                    model=self.model,
+                    platform=getattr(self, "platform", None) or "",
+                )
+                for _hook_result in _transform_results:
+                    if isinstance(_hook_result, str) and _hook_result:
+                        final_response = _hook_result
+                        break  # First non-empty string wins
+            except Exception as exc:
+                logger.warning("transform_llm_output hook failed: %s", exc)
 
         # Plugin hook: post_llm_call
         # Fired once per turn after the tool-calling loop completes.
