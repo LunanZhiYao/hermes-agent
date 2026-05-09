@@ -291,6 +291,24 @@ TOOL_CATEGORIES = {
                 ],
             },
             {
+                "name": "Aliyun OpenSearch",
+                "badge": "China · AI Search",
+                "tag": "Alibaba Cloud AI Search web-search (ops-web-search-001); search-only — optional ALIYUN_OPENSEARCH_CONTENT_TYPE=summary|snippet",
+                "web_backend": "aliyun_opensearch",
+                "env_vars": [
+                    {
+                        "key": "ALIYUN_OPENSEARCH_WEB_SEARCH_URL",
+                        "prompt": "Full POST URL (…/workspaces/<ws>/web-search/ops-web-search-001)",
+                        "url": "https://help.aliyun.com/zh/open-search/search-platform/developer-reference/web-search",
+                    },
+                    {
+                        "key": "ALIYUN_OPENSEARCH_API_KEY",
+                        "prompt": "API-KEY value for Authorization: Bearer …",
+                        "url": "https://help.aliyun.com/zh/open-search/search-platform/developer-reference/web-search",
+                    },
+                ],
+            },
+            {
                 "name": "Firecrawl Self-Hosted",
                 "badge": "free · self-hosted",
                 "tag": "Run your own Firecrawl instance (Docker)",
