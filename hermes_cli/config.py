@@ -3975,6 +3975,91 @@ def read_raw_config() -> Dict[str, Any]:
         return data
 
 
+def _read_raw_config_disk(config_yaml: Path) -> Dict[str, Any]:
+    """Parse *config_yaml* as YAML; return {} on missing file or parse errors."""
+    if not config_yaml.is_file():
+        return {}
+    try:
+        with open(config_yaml, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _apply_hermes_webui_shared_auxiliary(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Overlay host ``config.yaml`` sections for Hermes WebUI SaaS tenant processes.
+
+    When ``HERMES_WEBUI_SHARED_HERMES_HOME`` is set and ``HERMES_HOME`` points at
+    a tenant directory, ``load_config`` would otherwise merge only the tenant file
+    with ``DEFAULT_CONFIG``. That breaks in two ways:
+
+    1. Default-filled ``auxiliary`` / ``model`` from the merged dict overrides
+       host ``auxiliary.vision`` and host ``model.provider`` (named custom routes).
+    2. ``agent.auxiliary_client._read_main_provider()`` reads ``load_config()`` —
+       an empty tenant ``model:`` means vision ``auto`` cannot follow the user's
+       main ``custom:…`` provider (see WebUI logs: vision fails with
+       ``provider=auto`` while the main model works).
+
+    Merge order for each overlaid section: **shared host YAML first**, then only
+    keys present in the tenant file's **on-disk** YAML (same pattern as
+    ``auxiliary``), so defaults never clobber host settings.
+    """
+    raw = os.environ.get("HERMES_WEBUI_SHARED_HERMES_HOME", "").strip()
+    if not raw:
+        return config
+    try:
+        shared_root = Path(raw).expanduser().resolve()
+        tenant_root = get_hermes_home().resolve()
+    except Exception:
+        return config
+    if shared_root == tenant_root:
+        return config
+    shared_yaml = shared_root / "config.yaml"
+    if not shared_yaml.is_file():
+        return config
+    try:
+        shared_user = _read_raw_config_disk(shared_yaml)
+        if not shared_user:
+            return config
+        tenant_raw = _read_raw_config_disk(tenant_root / "config.yaml")
+
+        # ── auxiliary ─────────────────────────────────────────────────────
+        shared_aux = shared_user.get("auxiliary")
+        if isinstance(shared_aux, dict) and shared_aux:
+            t_aux = tenant_raw.get("auxiliary")
+            t_aux = t_aux if isinstance(t_aux, dict) else {}
+            merged_aux = _deep_merge(copy.deepcopy(shared_aux), copy.deepcopy(t_aux))
+            config["auxiliary"] = _expand_env_vars(merged_aux)
+
+        # ── model / providers / custom_providers (vision auto + named custom) ─
+        shared_model = shared_user.get("model")
+        if isinstance(shared_model, dict) and str(shared_model.get("provider", "")).strip():
+            t_model = tenant_raw.get("model")
+            t_model = t_model if isinstance(t_model, dict) else {}
+            config["model"] = _expand_env_vars(
+                _deep_merge(copy.deepcopy(shared_model), copy.deepcopy(t_model))
+            )
+
+        shared_prov = shared_user.get("providers")
+        if isinstance(shared_prov, dict) and shared_prov:
+            t_prov = tenant_raw.get("providers")
+            t_prov = t_prov if isinstance(t_prov, dict) else {}
+            merged_prov = _deep_merge(copy.deepcopy(shared_prov), copy.deepcopy(t_prov))
+            config["providers"] = _expand_env_vars(merged_prov)
+
+        s_cp = shared_user.get("custom_providers")
+        t_cp = tenant_raw.get("custom_providers")
+        if s_cp and (t_cp is None or t_cp == []):
+            config["custom_providers"] = _expand_env_vars(copy.deepcopy(s_cp))
+    except Exception:
+        logger.warning(
+            "HERMES_WEBUI_SHARED_HERMES_HOME shared-config overlay failed",
+            exc_info=True,
+        )
+    return config
+
+
 def load_config() -> Dict[str, Any]:
     """Load configuration from ~/.hermes/config.yaml.
 
@@ -3998,7 +4083,7 @@ def load_config() -> Dict[str, Any]:
 
         cached = _LOAD_CONFIG_CACHE.get(path_key)
         if cached is not None and cache_key is not None and cached[:2] == cache_key:
-            return copy.deepcopy(cached[2])
+            return _apply_hermes_webui_shared_auxiliary(copy.deepcopy(cached[2]))
 
         config = copy.deepcopy(DEFAULT_CONFIG)
 
@@ -4025,7 +4110,7 @@ def load_config() -> Dict[str, Any]:
             _LOAD_CONFIG_CACHE[path_key] = (cache_key[0], cache_key[1], copy.deepcopy(expanded))
         else:
             _LOAD_CONFIG_CACHE.pop(path_key, None)
-        return expanded
+        return _apply_hermes_webui_shared_auxiliary(expanded)
 
 
 _SECURITY_COMMENT = """
