@@ -151,7 +151,7 @@ ALIYUN_OPENSEARCH_SEARCH_SCHEMA = {
 }
 
 registry.register(
-    name="aliyun_opensearch_search",
+    name="aliyun_opensearch",
     toolset="aliyun_opensearch",
     schema=ALIYUN_OPENSEARCH_SEARCH_SCHEMA,
     handler=lambda args, **kw: aliyun_opensearch_search(
