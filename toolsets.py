@@ -85,7 +85,17 @@ TOOLSETS = {
         "tools": ["web_search"],
         "includes": []
     },
-    
+
+    "aliyun_opensearch": {
+        "description": (
+            "Alibaba Cloud AI Search (OpenSearch) web-search API — standalone tool "
+            "``aliyun_opensearch_search``. Configure ALIYUN_OPENSEARCH_WEB_SEARCH_URL and "
+            "ALIYUN_OPENSEARCH_API_KEY; search-only (pair with web/browser for extraction)."
+        ),
+        "tools": [],
+        "includes": [],
+    },
+
     "vision": {
         "description": "Image analysis and vision tools",
         "tools": ["vision_analyze"],
