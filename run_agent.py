@@ -558,36 +558,6 @@ def _sanitize_surrogates(text: str) -> str:
     return text
 
 
-# Must stay aligned with ``merge_global_policy_into_workspace`` / ephemeral tail in hermes-webui
-# ``api/streaming.py`` when operators verify GLOBAL_POLICY injection via DEBUG logs.
-_EPHEMERAL_GLOBAL_POLICY_TAIL_SENTINEL = (
-    "[Deployment policy — repeated at request tail for reasoning-channel compliance]"
-)
-
-
-def _debug_log_effective_system_tail(
-    effective_system: str | None,
-    *,
-    tag: str = "run_agent",
-    max_chars: int = 1200,
-) -> None:
-    """DEBUG: trailing slice of assembled system + whether WebUI ephemeral policy sentinel is present."""
-    if not logger.isEnabledFor(logging.DEBUG):
-        return
-    if not effective_system:
-        logger.debug("[%s] effective_system tail: (empty)", tag)
-        return
-    _sentinel_ok = _EPHEMERAL_GLOBAL_POLICY_TAIL_SENTINEL in effective_system
-    logger.debug(
-        "[%s] effective_system ephemeral GLOBAL_POLICY tail sentinel present: %s",
-        tag,
-        _sentinel_ok,
-    )
-    n = len(effective_system)
-    tail = effective_system[-max_chars:] if n > max_chars else effective_system
-    logger.debug("[%s] effective_system tail last %d/%d chars: %r", tag, len(tail), n, tail)
-
-
 # _summarize_user_message_for_log is imported from agent.codex_responses_adapter
 # (see import block above). Remains importable from run_agent for backward compat.
 
@@ -1472,15 +1442,7 @@ class AIAgent:
                     'hermes_cli',           # CLI helpers
                 ]:
                     logging.getLogger(quiet_logger).setLevel(logging.ERROR)
-                # WebUI sets quiet_mode=True (suppresses run_agent below ERROR).
-                # Operators can re-enable DEBUG for ``run_agent`` without full verbose_logging::
-                #   HERMES_RUN_AGENT_LOG_LEVEL=DEBUG
-                # Pair with ``logging.level: DEBUG`` in config.yaml (or equivalent) so
-                # ``~/.hermes/logs/agent.log`` handlers accept DEBUG records.
-                _ral = (os.environ.get("HERMES_RUN_AGENT_LOG_LEVEL") or "").strip().upper()
-                if _ral == "DEBUG":
-                    logging.getLogger("run_agent").setLevel(logging.DEBUG)
-
+        
         # Internal stream callback (set during streaming TTS).
         # Initialized here so _vprint can reference it before run_conversation.
         self._stream_callback = None
@@ -10847,10 +10809,6 @@ class AIAgent:
             effective_system = self._cached_system_prompt or ""
             if self.ephemeral_system_prompt:
                 effective_system = (effective_system + "\n\n" + self.ephemeral_system_prompt).strip()
-            _debug_log_effective_system_tail(
-                effective_system,
-                tag=f"session={getattr(self, 'session_id', '') or '-'} path=max_iter_summary",
-            )
             if effective_system:
                 api_messages = [{"role": "system", "content": effective_system}] + api_messages
             if self.prefill_messages:
@@ -11602,10 +11560,6 @@ class AIAgent:
             effective_system = active_system_prompt or ""
             if self.ephemeral_system_prompt:
                 effective_system = (effective_system + "\n\n" + self.ephemeral_system_prompt).strip()
-            _debug_log_effective_system_tail(
-                effective_system,
-                tag=f"session={getattr(self, 'session_id', '') or '-'} path=main_loop",
-            )
             # NOTE: Plugin context from pre_llm_call hooks is injected into the
             # user message (see injection block above), NOT the system prompt.
             # This is intentional — system prompt modifications break the prompt
