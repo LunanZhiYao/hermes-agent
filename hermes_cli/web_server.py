@@ -47,6 +47,7 @@ from hermes_cli.config import (
     check_config_version,
     redact_key,
 )
+from hermes_constants import get_default_hermes_root
 from gateway.status import get_running_pid, read_runtime_status
 
 try:
@@ -2845,7 +2846,8 @@ async def delete_profile_endpoint(name: str):
 
 @app.get("/api/profiles/{name}/soul")
 async def get_profile_soul(name: str):
-    soul_path = _resolve_profile_dir(name) / "SOUL.md"
+    _resolve_profile_dir(name)
+    soul_path = get_default_hermes_root() / "SOUL.md"
     if soul_path.exists():
         try:
             return {"content": soul_path.read_text(encoding="utf-8"), "exists": True}
@@ -2856,8 +2858,10 @@ async def get_profile_soul(name: str):
 
 @app.put("/api/profiles/{name}/soul")
 async def update_profile_soul(name: str, body: ProfileSoulUpdate):
-    soul_path = _resolve_profile_dir(name) / "SOUL.md"
+    _resolve_profile_dir(name)
+    soul_path = get_default_hermes_root() / "SOUL.md"
     try:
+        soul_path.parent.mkdir(parents=True, exist_ok=True)
         soul_path.write_text(body.content, encoding="utf-8")
     except OSError as e:
         _log.exception("PUT /api/profiles/%s/soul failed", name)

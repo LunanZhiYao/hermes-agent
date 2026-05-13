@@ -1159,7 +1159,8 @@ class AIAgent:
             skip_context_files (bool): If True, skip auto-injection of SOUL.md, AGENTS.md, and .cursorrules
                 into the system prompt. Use this for batch processing and data generation to avoid
                 polluting trajectories with user-specific persona or project instructions.
-            load_soul_identity (bool): If True, still use ~/.hermes/SOUL.md as the primary
+            load_soul_identity (bool): If True, still load the shared install-root SOUL.md
+                (``get_default_hermes_root()/SOUL.md``, usually ``~/.hermes/SOUL.md``) as the primary
                 identity even when skip_context_files=True. Project context files from the cwd
                 remain skipped.
         """
