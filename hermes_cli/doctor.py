@@ -13,7 +13,7 @@ from pathlib import Path
 
 from hermes_cli.config import get_project_root, get_hermes_home, get_env_path
 from hermes_cli.env_loader import load_hermes_dotenv
-from hermes_constants import display_hermes_home, get_default_hermes_root
+from hermes_constants import display_hermes_home
 
 PROJECT_ROOT = get_project_root()
 HERMES_HOME = get_hermes_home()
@@ -749,34 +749,29 @@ def run_doctor(args):
         else:
             check_warn(f"{_DHH}/{subdir_name}/ not found", "(will be created on first use)")
     
-    # Check for SOUL.md persona file (shared install root — all profiles use this)
-    soul_root = get_default_hermes_root()
-    soul_path = soul_root / "SOUL.md"
-    try:
-        soul_disp = "~/" + str(soul_path.resolve().relative_to(Path.home()))
-    except ValueError:
-        soul_disp = str(soul_path)
+    # Check for SOUL.md persona file
+    soul_path = hermes_home / "SOUL.md"
     if soul_path.exists():
         content = soul_path.read_text(encoding="utf-8").strip()
         # Check if it's just the template comments (no real content)
         lines = [l for l in content.splitlines() if l.strip() and not l.strip().startswith(("<!--", "-->", "#"))]
         if lines:
-            check_ok(f"{soul_disp} exists (shared persona / SOUL.md configured)")
+            check_ok(f"{_DHH}/SOUL.md exists (persona configured)")
         else:
-            check_info(f"{soul_disp} exists but is empty — edit it to customize personality")
+            check_info(f"{_DHH}/SOUL.md exists but is empty — edit it to customize personality")
     else:
-        check_warn(f"{soul_disp} not found", "(create it to give Hermes a custom personality)")
+        check_warn(f"{_DHH}/SOUL.md not found", "(create it to give Hermes a custom personality)")
         if should_fix:
-            soul_root.mkdir(parents=True, exist_ok=True)
+            soul_path.parent.mkdir(parents=True, exist_ok=True)
             soul_path.write_text(
                 "# Hermes Agent Persona\n\n"
                 "<!-- Edit this file to customize how Hermes communicates. -->\n\n"
                 "You are Hermes, a helpful AI assistant.\n",
                 encoding="utf-8",
             )
-            check_ok(f"Created {soul_disp} with basic template")
+            check_ok(f"Created {_DHH}/SOUL.md with basic template")
             fixed_count += 1
-    
+
     # Check memory directory
     memories_dir = hermes_home / "memories"
     if memories_dir.exists():

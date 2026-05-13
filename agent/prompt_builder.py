@@ -12,7 +12,7 @@ import threading
 from collections import OrderedDict
 from pathlib import Path
 
-from hermes_constants import get_default_hermes_root, get_hermes_home, get_skills_dir, is_wsl
+from hermes_constants import get_hermes_home, get_skills_dir, is_wsl
 from typing import Optional
 
 from agent.skill_utils import (
@@ -1307,11 +1307,7 @@ def _truncate_content(content: str, filename: str, max_chars: int = CONTEXT_FILE
 
 
 def load_soul_md() -> Optional[str]:
-    """Load SOUL.md from the Hermes install root and return its content, or None.
-
-    Identity is always read from ``get_default_hermes_root() / SOUL.md`` so
-    every profile, tenant path under ``~/.hermes/``, and named ``HERMES_HOME``
-    shares one persona file (typically ``~/.hermes/SOUL.md``).
+    """Load SOUL.md from HERMES_HOME and return its content, or None.
 
     Used as the agent identity (slot #1 in the system prompt).  When this
     returns content, ``build_context_files_prompt`` should be called with
@@ -1323,7 +1319,7 @@ def load_soul_md() -> Optional[str]:
     except Exception as e:
         logger.debug("Could not ensure HERMES_HOME before loading SOUL.md: %s", e)
 
-    soul_path = get_default_hermes_root() / "SOUL.md"
+    soul_path = get_hermes_home() / "SOUL.md"
     if not soul_path.exists():
         return None
     try:
@@ -1432,8 +1428,7 @@ def build_context_files_prompt(cwd: Optional[str] = None, skip_soul: bool = Fals
       3. CLAUDE.md / claude.md   (cwd only)
       4. .cursorrules / .cursor/rules/*.mdc  (cwd only)
 
-    SOUL.md from the Hermes install root (see ``load_soul_md``) is independent
-    and always included when present.
+    SOUL.md from HERMES_HOME is independent and always included when present.
     Each context source is capped at 20,000 chars.
 
     When *skip_soul* is True, SOUL.md is not included here (it was already
@@ -1455,7 +1450,7 @@ def build_context_files_prompt(cwd: Optional[str] = None, skip_soul: bool = Fals
     if project_context:
         sections.append(project_context)
 
-    # SOUL.md from Hermes install root only — skip when already loaded as identity
+    # SOUL.md from HERMES_HOME only — skip when already loaded as identity
     if not skip_soul:
         soul_content = load_soul_md()
         if soul_content:

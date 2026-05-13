@@ -291,7 +291,7 @@ def get_container_exec_info() -> Optional[dict]:
 # =============================================================================
 
 # Re-export from hermes_constants — canonical definition lives there.
-from hermes_constants import get_default_hermes_root, get_hermes_home  # noqa: F811,E402
+from hermes_constants import get_hermes_home  # noqa: F811,E402
 from utils import atomic_replace
 
 def get_config_path() -> Path:
@@ -406,8 +406,6 @@ def ensure_hermes_home():
             d.mkdir(parents=True, exist_ok=True)
             _secure_dir(d)
         _ensure_default_soul_md(home)
-        # Shared persona: one SOUL.md at the Hermes root for all profiles / tenant dirs.
-        _ensure_default_soul_md(get_default_hermes_root())
 
 
 def _ensure_hermes_home_managed(home: Path):
@@ -430,7 +428,6 @@ def _ensure_hermes_home_managed(home: Path):
     (home / "logs" / "curator").mkdir(parents=True, exist_ok=True)
     # Inside umask(0o007) scope — SOUL.md will be created as 0660
     _ensure_default_soul_md(home)
-    _ensure_default_soul_md(get_default_hermes_root())
 
 
 # =============================================================================
