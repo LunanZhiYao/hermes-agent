@@ -101,6 +101,8 @@ class CustomImageGenProvider(ImageGenProvider):
         self,
         prompt: str,
         aspect_ratio: str = DEFAULT_ASPECT_RATIO,
+        size: Optional[str] = None,
+        n: int = 1,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """Generate an image using the custom API endpoint.
@@ -108,6 +110,8 @@ class CustomImageGenProvider(ImageGenProvider):
         Args:
             prompt: The text prompt describing the image to generate
             aspect_ratio: One of 'landscape', 'square', or 'portrait'
+            size: Image size in format 'widthxheight' (e.g., '1024x1024'), overrides aspect_ratio if provided
+            n: Number of images to generate (range: 1-4, default: 1)
             **kwargs: Additional parameters (ignored for forward compatibility)
             
         Returns:
@@ -124,24 +128,37 @@ class CustomImageGenProvider(ImageGenProvider):
                 aspect_ratio=aspect,
             )
 
+        # Validate and clamp n to valid range (1-4)
+        n = max(1, min(4, int(n)))
+        
         api_url = _get_api_url()
-        dimensions = _SIZES.get(aspect, _SIZES["landscape"])
+        
+        # Determine dimensions: size parameter takes precedence over aspect_ratio
+        if size:
+            try:
+                width, height = map(int, size.split('x'))
+                dimensions = {"width": width, "height": height}
+            except (ValueError, AttributeError):
+                logger.warning(f"Invalid size format '{size}', falling back to aspect_ratio")
+                dimensions = _SIZES.get(aspect, _SIZES["landscape"])
+        else:
+            dimensions = _SIZES.get(aspect, _SIZES["landscape"])
 
         # Build the request payload according to the API specification
         payload = {
-            "model": "",  # Empty as specified
+            "model": None,  # Use default model on server side
             "prompt": prompt,
-            "negative_prompt": "",
-            "n": 1,
+            "negative_prompt": None,  # No negative prompt by default
+            "n": n,  # Number of images to generate (range: 1-4)
             "height": dimensions["height"],
             "width": dimensions["width"],
-            "response_format": "url",
-            "num_inference_steps": 9,
-            "guidance_scale": 0.0,
-            "seed": None,
-            "cfg_normalization": False,
-            "cfg_truncation": 1.0,
-            "max_sequence_length": 512,
+            "response_format": "b64_json",  # Return base64 encoded image
+            "num_inference_steps": 30,  # Balanced quality/speed (range: 1-100)
+            "guidance_scale": 7.5,  # Good balance for prompt adherence (range: 0.0-20.0)
+            "seed": None,  # Random seed for variety
+            "cfg_normalization": True,  # Enable CFG normalization for better quality
+            "cfg_truncation": 1.0,  # Default truncation value (range: 0.0-2.0)
+            "max_sequence_length": 512,  # Maximum sequence length (range: 1-512)
         }
 
         try:
@@ -170,7 +187,7 @@ class CustomImageGenProvider(ImageGenProvider):
             result = response.json()
             logger.debug(f"Response data: {result}")
 
-            # Parse the response format: {"created": ..., "data": [{"url": "..."}]}
+            # Parse the response format: {"created": ..., "data": [{"b64_json": "..."}]}
             data = result.get("data", [])
             if not data:
                 return error_response(
@@ -183,17 +200,20 @@ class CustomImageGenProvider(ImageGenProvider):
                 )
 
             first_image = data[0]
-            image_url = first_image.get("url")
+            b64_json = first_image.get("b64_json")
             
-            if not image_url:
+            if not b64_json:
                 return error_response(
-                    error="API response does not contain an image URL",
+                    error="API response does not contain base64 image data",
                     error_type="empty_response",
                     provider="custom",
                     model="custom-model",
                     prompt=prompt,
                     aspect_ratio=aspect,
                 )
+
+            # Convert base64 to data URL format
+            image_url = f"data:image/png;base64,{b64_json}"
 
             return success_response(
                 image=image_url,
@@ -204,6 +224,7 @@ class CustomImageGenProvider(ImageGenProvider):
                 extra={
                     "size": f"{dimensions['width']}x{dimensions['height']}",
                     "api_url": api_url,
+                    "format": "base64",
                 },
             )
 
