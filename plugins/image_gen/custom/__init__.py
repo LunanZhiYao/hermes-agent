@@ -1,8 +1,9 @@
 """Custom image generation backend.
 
 Uses a local API endpoint at http://10.0.20.130:8091/v1/images/generations
-to generate images via POST requests. Returns image URLs directly from the
-API response.
+to generate images via POST requests. Saves generated images to both the
+Hermes cache directory and the user's workspace directory, returning the
+workspace file path so the WebUI MEDIA: mechanism can render them inline.
 
 Configuration (optional):
     - CUSTOM_IMAGE_API_URL: Override the default API URL
@@ -13,6 +14,8 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -22,6 +25,7 @@ from agent.image_gen_provider import (
     ImageGenProvider,
     error_response,
     resolve_aspect_ratio,
+    save_b64_image,
     success_response,
 )
 
@@ -41,6 +45,61 @@ _SIZES = {
 def _get_api_url() -> str:
     """Get the API URL from environment or use default."""
     return os.environ.get("CUSTOM_IMAGE_API_URL", DEFAULT_API_URL)
+
+
+def _get_workspace_dir() -> Optional[Path]:
+    """获取当前用户的 workspace 目录路径。
+
+    优先级：
+    1. TERMINAL_CWD 环境变量（WebUI 多租户模式下设置）
+    2. HERMES_WEBUI_STATE_DIR 下的 workspace 子目录
+    3. 返回 None 表示无法确定 workspace
+    """
+    # WebUI 多租户模式通过 TERMINAL_CWD 传递 workspace 路径
+    terminal_cwd = os.environ.get("TERMINAL_CWD", "").strip()
+    if terminal_cwd:
+        ws = Path(terminal_cwd).expanduser().resolve()
+        if ws.is_dir():
+            return ws
+
+    # 回退：从 HERMES_WEBUI_STATE_DIR 推导
+    state_dir = os.environ.get("HERMES_WEBUI_STATE_DIR", "").strip()
+    if state_dir:
+        ws = Path(state_dir).expanduser().resolve() / "workspace"
+        if ws.is_dir():
+            return ws
+
+    return None
+
+
+def _save_to_workspace(cached_path: Path, prompt: str) -> Optional[Path]:
+    """将缓存中的图片复制到用户 workspace 目录下的 generated_images/ 子目录。
+
+    Args:
+        cached_path: 图片在 Hermes cache 中的路径
+        prompt: 生成图片的提示词（用于生成有意义的文件名）
+
+    Returns:
+        复制后的 workspace 文件路径，如果无法确定 workspace 则返回 None
+    """
+    workspace = _get_workspace_dir()
+    if workspace is None:
+        logger.debug("无法确定 workspace 目录，跳过复制到 workspace")
+        return None
+
+    # 在 workspace 下创建 generated_images 子目录
+    output_dir = workspace / "generated_images"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # 生成文件名：使用缓存文件的原始文件名（含时间戳和短UUID）
+    dest_path = output_dir / cached_path.name
+    try:
+        shutil.copy2(cached_path, dest_path)
+        logger.info(f"图片已复制到 workspace: {dest_path}")
+        return dest_path
+    except Exception as exc:
+        logger.warning(f"复制图片到 workspace 失败: {exc}")
+        return None
 
 
 class CustomImageGenProvider(ImageGenProvider):
@@ -212,11 +271,23 @@ class CustomImageGenProvider(ImageGenProvider):
                     aspect_ratio=aspect,
                 )
 
-            # Convert base64 to data URL format
-            image_url = f"data:image/png;base64,{b64_json}"
+            # 将 base64 数据保存为本地文件（而非拼接 data URL）
+            # 1. 保存到 Hermes 缓存目录 ($HERMES_HOME/cache/images/)
+            cached_path = save_b64_image(
+                b64_json, prefix="custom", extension="png"
+            )
+            logger.info(f"图片已缓存到: {cached_path}")
+
+            # 2. 复制到用户 workspace 目录，优先返回 workspace 路径
+            #    这样前端 MEDIA: 机制可以通过 api/media 端点加载图片
+            workspace_path = _save_to_workspace(cached_path, prompt)
+
+            # 返回 workspace 路径（优先）或缓存路径作为 image 字段
+            # Agent 会将此路径包装为 MEDIA:<path>，前端通过 api/media 渲染
+            image_path = str(workspace_path) if workspace_path else str(cached_path)
 
             return success_response(
-                image=image_url,
+                image=image_path,
                 model="custom-model",
                 prompt=prompt,
                 aspect_ratio=aspect,
@@ -224,7 +295,9 @@ class CustomImageGenProvider(ImageGenProvider):
                 extra={
                     "size": f"{dimensions['width']}x{dimensions['height']}",
                     "api_url": api_url,
-                    "format": "base64",
+                    "format": "file",
+                    "cached_path": str(cached_path),
+                    "workspace_path": str(workspace_path) if workspace_path else None,
                 },
             )
 
