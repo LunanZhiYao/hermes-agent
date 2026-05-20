@@ -153,10 +153,10 @@ class CustomImageGenProvider(ImageGenProvider):
             "height": dimensions["height"],
             "width": dimensions["width"],
             "response_format": "b64_json",  # Return base64 encoded image
-            "num_inference_steps": 30,  # Balanced quality/speed (range: 1-100)
-            "guidance_scale": 7.5,  # Good balance for prompt adherence (range: 0.0-20.0)
+            "num_inference_steps": 9,  # Balanced quality/speed (range: 1-100)
+            "guidance_scale": 0.0,  # Good balance for prompt adherence (range: 0.0-20.0)
             "seed": None,  # Random seed for variety
-            "cfg_normalization": True,  # Enable CFG normalization for better quality
+            "cfg_normalization": False,  # Enable CFG normalization for better quality
             "cfg_truncation": 1.0,  # Default truncation value (range: 0.0-2.0)
             "max_sequence_length": 512,  # Maximum sequence length (range: 1-512)
         }

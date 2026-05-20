@@ -1285,6 +1285,60 @@ class PluginManager:
 
 _plugin_manager: Optional[PluginManager] = None
 
+# Multi-tenant support: per-tenant plugin manager cache
+_tenant_managers: Dict[str, PluginManager] = {}
+_current_hermes_home: Optional[str] = None
+
+
+def _get_hermes_home_key() -> str:
+    """Get the current HERMES_HOME as a cache key."""
+    return os.environ.get("HERMES_HOME", "").strip() or "__default__"
+
+
+def switch_tenant_plugins() -> bool:
+    """Switch to the appropriate tenant plugin context based on current HERMES_HOME.
+    
+    Returns True if context was switched (cache hit), False if no cache exists
+    (caller should trigger plugin discovery).
+    
+    This is the core of multi-tenant support for plugins:
+    - If HERMES_HOME matches current context, do nothing (fast path)
+    - If HERMES_HOME changed and we have a cache, restore from cache
+    - If HERMES_HOME changed and no cache, return False to signal discovery needed
+    """
+    global _plugin_manager, _current_hermes_home
+    
+    hermes_home = _get_hermes_home_key()
+    
+    # Fast path: same context, nothing to do
+    if hermes_home == _current_hermes_home and _plugin_manager is not None:
+        return True
+    
+    # Save current context before switching (if exists)
+    if _current_hermes_home is not None and _plugin_manager is not None:
+        _tenant_managers[_current_hermes_home] = _plugin_manager
+        logger.debug(
+            "Saved plugin manager to cache for HERMES_HOME=%s",
+            _current_hermes_home
+        )
+    
+    # Check if we have a cached manager for the new HERMES_HOME
+    cached = _tenant_managers.get(hermes_home)
+    if cached is not None:
+        _plugin_manager = cached
+        _current_hermes_home = hermes_home
+        logger.debug(
+            "Restored plugin manager from cache for HERMES_HOME=%s",
+            hermes_home
+        )
+        return True
+    
+    # No cache exists - create new manager and signal that discovery is needed
+    _plugin_manager = PluginManager()
+    _current_hermes_home = hermes_home
+    logger.debug("No plugin cache for HERMES_HOME=%s, discovery needed", hermes_home)
+    return False
+
 
 def get_plugin_manager() -> PluginManager:
     """Return (and lazily create) the global PluginManager singleton."""
@@ -1355,7 +1409,18 @@ def _ensure_plugins_discovered(force: bool = False) -> PluginManager:
     """Return the global manager after ensuring plugin discovery has run.
 
     Pass ``force=True`` to rescan in the current process.
+    
+    In multi-tenant mode, this function automatically switches to the correct
+    tenant context based on HERMES_HOME, using cached plugin managers when
+    available to avoid redundant discovery.
     """
+    # Try to switch to the correct tenant context (uses cache if available)
+    if not force and not switch_tenant_plugins():
+        # Cache miss - need to discover plugins for this tenant
+        manager = get_plugin_manager()
+        manager.discover_and_load(force=True)
+        return manager
+    
     manager = get_plugin_manager()
     manager.discover_and_load(force=force)
     return manager

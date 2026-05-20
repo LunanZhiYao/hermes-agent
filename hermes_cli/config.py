@@ -4142,6 +4142,14 @@ def _apply_hermes_webui_shared_auxiliary(config: Dict[str, Any]) -> Dict[str, An
         t_cp = tenant_raw.get("custom_providers")
         if s_cp and (t_cp is None or t_cp == []):
             config["custom_providers"] = _expand_env_vars(copy.deepcopy(s_cp))
+
+        # -- image_gen (SaaS tenant dir has no image_gen config, inherit from shared) --
+        shared_ig = shared_user.get("image_gen")
+        if isinstance(shared_ig, dict) and shared_ig:
+            t_ig = tenant_raw.get("image_gen")
+            t_ig = t_ig if isinstance(t_ig, dict) else {}
+            merged_ig = _deep_merge(copy.deepcopy(shared_ig), copy.deepcopy(t_ig))
+            config["image_gen"] = _expand_env_vars(merged_ig)
     except Exception:
         logger.warning(
             "HERMES_WEBUI_SHARED_HERMES_HOME shared-config overlay failed",
