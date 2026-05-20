@@ -50,34 +50,46 @@ def _get_api_url() -> str:
 def _get_workspace_dir() -> Optional[Path]:
     """获取当前用户的 workspace 目录路径。
 
+    多租户模式下，WebUI 会设置 HERMES_HOME 为租户根目录（如 ~/.hermes/users/xxx/），
+    用户 workspace 固定在 $HERMES_HOME/workspace/。
+
     优先级：
-    1. TERMINAL_CWD 环境变量（WebUI 多租户模式下设置）
-    2. HERMES_WEBUI_STATE_DIR 下的 workspace 子目录
+    1. HERMES_HOME/workspace/（多租户模式下最可靠，由 WebUI streaming.py 设置）
+    2. TERMINAL_CWD 环境变量（非多租户模式的回退）
     3. 返回 None 表示无法确定 workspace
     """
-    # WebUI 多租户模式通过 TERMINAL_CWD 传递 workspace 路径
+    # 优先：从 HERMES_HOME 推导 workspace（多租户模式下 HERMES_HOME 已被设为租户目录）
+    hermes_home = os.environ.get("HERMES_HOME", "").strip()
+    if hermes_home:
+        ws = Path(hermes_home).expanduser().resolve() / "workspace"
+        if ws.is_dir():
+            logger.debug("通过 HERMES_HOME 确定用户 workspace: %s", ws)
+            return ws
+        # 目录不存在时尝试创建（租户首次生成图片的情况）
+        try:
+            ws.mkdir(parents=True, exist_ok=True)
+            logger.debug("已创建用户 workspace 目录: %s", ws)
+            return ws
+        except Exception as exc:
+            logger.debug("创建 workspace 目录失败: %s", exc)
+
+    # 回退：TERMINAL_CWD（非多租户模式，或 HERMES_HOME 未设置时）
     terminal_cwd = os.environ.get("TERMINAL_CWD", "").strip()
     if terminal_cwd:
         ws = Path(terminal_cwd).expanduser().resolve()
         if ws.is_dir():
-            return ws
-
-    # 回退：从 HERMES_WEBUI_STATE_DIR 推导
-    state_dir = os.environ.get("HERMES_WEBUI_STATE_DIR", "").strip()
-    if state_dir:
-        ws = Path(state_dir).expanduser().resolve() / "workspace"
-        if ws.is_dir():
+            logger.debug("通过 TERMINAL_CWD 确定 workspace: %s", ws)
             return ws
 
     return None
 
 
 def _save_to_workspace(cached_path: Path, prompt: str) -> Optional[Path]:
-    """将缓存中的图片复制到用户 workspace 目录下的 generated_images/ 子目录。
+    """将缓存中的图片复制到用户 workspace 根目录下。
 
     Args:
         cached_path: 图片在 Hermes cache 中的路径
-        prompt: 生成图片的提示词（用于生成有意义的文件名）
+        prompt: 生成图片的提示词（未使用，保留接口兼容）
 
     Returns:
         复制后的 workspace 文件路径，如果无法确定 workspace 则返回 None
@@ -87,18 +99,14 @@ def _save_to_workspace(cached_path: Path, prompt: str) -> Optional[Path]:
         logger.debug("无法确定 workspace 目录，跳过复制到 workspace")
         return None
 
-    # 在 workspace 下创建 generated_images 子目录
-    output_dir = workspace / "generated_images"
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # 生成文件名：使用缓存文件的原始文件名（含时间戳和短UUID）
-    dest_path = output_dir / cached_path.name
+    # 直接保存到 workspace 根目录（不创建子目录）
+    dest_path = workspace / cached_path.name
     try:
         shutil.copy2(cached_path, dest_path)
-        logger.info(f"图片已复制到 workspace: {dest_path}")
+        logger.info("图片已复制到用户 workspace: %s", dest_path)
         return dest_path
     except Exception as exc:
-        logger.warning(f"复制图片到 workspace 失败: {exc}")
+        logger.warning("复制图片到 workspace 失败: %s", exc)
         return None
 
 
