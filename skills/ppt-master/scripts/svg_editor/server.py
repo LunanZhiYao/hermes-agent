@@ -607,7 +607,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     logger.info('project: %s', project_path)
     logger.info('svg_output: %s (%d slides)', svg_output, svg_count)
     logger.info('idle timeout: %ds (0 = disabled)', idle_timeout)
-    app.run(host='127.0.0.1', port=args.port, debug=False)
+    app.run(host='0.0.0.0', port=args.port, debug=False)
     return 0
 
 
