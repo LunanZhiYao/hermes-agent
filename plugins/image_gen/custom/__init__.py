@@ -34,12 +34,16 @@ logger = logging.getLogger(__name__)
 # Default API configuration
 DEFAULT_API_URL = "http://10.0.20.130:8091/v1/images/generations"
 
-# Aspect ratio to dimension mapping
-_SIZES = {
+# Default dimensions when only aspect_ratio is specified (no explicit size)
+_DEFAULT_SIZES = {
     "landscape": {"width": 1024, "height": 512},
     "square": {"width": 512, "height": 512},
     "portrait": {"width": 512, "height": 1024},
 }
+
+# Reasonable dimension limits for the custom API
+_MAX_DIMENSION = 4096
+_MIN_DIMENSION = 64
 
 
 def _get_api_url() -> str:
@@ -204,12 +208,15 @@ class CustomImageGenProvider(ImageGenProvider):
         if size:
             try:
                 width, height = map(int, size.split('x'))
+                # Clamp to valid range
+                width = max(_MIN_DIMENSION, min(_MAX_DIMENSION, width))
+                height = max(_MIN_DIMENSION, min(_MAX_DIMENSION, height))
                 dimensions = {"width": width, "height": height}
             except (ValueError, AttributeError):
                 logger.warning(f"Invalid size format '{size}', falling back to aspect_ratio")
-                dimensions = _SIZES.get(aspect, _SIZES["landscape"])
+                dimensions = _DEFAULT_SIZES.get(aspect, _DEFAULT_SIZES["landscape"])
         else:
-            dimensions = _SIZES.get(aspect, _SIZES["landscape"])
+            dimensions = _DEFAULT_SIZES.get(aspect, _DEFAULT_SIZES["landscape"])
 
         # Build the request payload according to the API specification
         payload = {

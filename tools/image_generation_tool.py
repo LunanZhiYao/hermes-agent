@@ -905,8 +905,12 @@ IMAGE_GENERATE_SCHEMA = {
             "aspect_ratio": {
                 "type": "string",
                 "enum": list(VALID_ASPECT_RATIOS),
-                "description": "The aspect ratio of the generated image. 'landscape' is 16:9 wide, 'portrait' is 16:9 tall, 'square' is 1:1.",
+                "description": "The aspect ratio of the generated image. 'landscape' is 16:9 wide, 'portrait' is 16:9 tall, 'square' is 1:1. Ignored when 'size' is provided.",
                 "default": DEFAULT_ASPECT_RATIO,
+            },
+            "size": {
+                "type": "string",
+                "description": "Exact image dimensions in 'widthxheight' format (e.g. '2560x1440', '1024x1024'). When provided, this takes precedence over aspect_ratio. Use this when the user specifies exact pixel dimensions.",
             },
         },
         "required": ["prompt"],
@@ -950,7 +954,7 @@ def _read_configured_image_provider():
     return None
 
 
-def _dispatch_to_plugin_provider(prompt: str, aspect_ratio: str):
+def _dispatch_to_plugin_provider(prompt: str, aspect_ratio: str, size: Optional[str] = None):
     """Route the call to a plugin-registered provider when one is selected.
 
     Returns a JSON string on dispatch, or ``None`` to fall through to the
@@ -1006,6 +1010,8 @@ def _dispatch_to_plugin_provider(prompt: str, aspect_ratio: str):
         kwargs = {"prompt": prompt, "aspect_ratio": aspect_ratio}
         if configured_model:
             kwargs["model"] = configured_model
+        if size:
+            kwargs["size"] = size
         result = provider.generate(**kwargs)
     except Exception as exc:
         logger.warning(
@@ -1033,10 +1039,11 @@ def _handle_image_generate(args, **kw):
     if not prompt:
         return tool_error("prompt is required for image generation")
     aspect_ratio = args.get("aspect_ratio", DEFAULT_ASPECT_RATIO)
+    size = args.get("size")
 
     # Route to a plugin-registered provider if one is active (and it's
     # not the in-tree FAL path).
-    dispatched = _dispatch_to_plugin_provider(prompt, aspect_ratio)
+    dispatched = _dispatch_to_plugin_provider(prompt, aspect_ratio, size=size)
     if dispatched is not None:
         return dispatched
 
